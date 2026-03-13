@@ -20,10 +20,14 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <string>
+#include <vector>
 #include <unordered_set>
 #include <fstream>
 #include <iomanip>
 #include <functional>
+#include <regex>
+#include <sstream>
 
 using mesh_t     = MeshQuad2;
 using funtest_t  = TestFunction<mesh_t>;
@@ -35,15 +39,135 @@ using cutspace_t = CutFESpace<mesh_t>;
 // ============================================================
 // Parameters
 // ============================================================
-static constexpr int N_ITERATIONS = 10; // 0, 1, 2
-static constexpr bool EXPORT_CARTILAGE = false;
-static constexpr bool EXPORT_ACTIVE    = false;
-static constexpr bool EXPORT_TRIMMED   = true;
+struct SimConfig {
+    int n_iterations = 10;
+    bool export_cartilage = false;
+    bool export_active = false;
+    bool export_trimmed = true;
+
+    double p1_geom = 0.9;
+    double p2_geom = 0.2;
+    std::vector<double> bspline_weights = {1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0};
+    int transfinite_nodes = 101;
+
+    double interface_y = 1.0;
+    double oss_height_target = 0.1;
+    double k_mi = 0.5;
+    double oss_spline_band = 0.3;
+
+    double load_center_u_frac = 0.50;
+    double load_du_frac = 0.08;
+    double load_radius_scale = 1.0;
+    double load_p_peak = 1.0;
+
+    int mesh_nx = 200;
+    double mesh_y_offset = -0.00113;
+
+    std::string output_dir = "output_growth_iterative";
+    std::string gmsh_model_name = "growth_iterative_cutfem";
+};
+
+static SimConfig g_cfg;
+
+static std::string trim_copy(const std::string &s) {
+    const std::string ws = " \t\n\r";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return "";
+    const size_t e = s.find_last_not_of(ws);
+    return s.substr(b, e - b + 1);
+}
+
+static bool parse_json_number(const std::string &text, const std::string &key, double &value) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*([-+]?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?)");
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) return false;
+    value = std::stod(m[1].str());
+    return true;
+}
+
+static bool parse_json_int(const std::string &text, const std::string &key, int &value) {
+    double tmp = 0.0;
+    if (!parse_json_number(text, key, tmp)) return false;
+    value = static_cast<int>(std::llround(tmp));
+    return true;
+}
+
+static bool parse_json_bool(const std::string &text, const std::string &key, bool &value) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*(true|false)");
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) return false;
+    value = (m[1].str() == "true");
+    return true;
+}
+
+static bool parse_json_string(const std::string &text, const std::string &key, std::string &value) {
+    const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) return false;
+    value = m[1].str();
+    return true;
+}
+
+static bool parse_json_number_array(
+    const std::string &text,
+    const std::string &key,
+    std::vector<double> &values)
+{
+    const std::regex re("\"" + key + "\"\\s*:\\s*\\[([^\\]]*)\\]");
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) return false;
+
+    std::vector<double> parsed;
+    std::stringstream ss(m[1].str());
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        const std::string tok = trim_copy(item);
+        if (tok.empty()) continue;
+        parsed.push_back(std::stod(tok));
+    }
+    if (parsed.empty()) return false;
+    values = std::move(parsed);
+    return true;
+}
+
+static bool load_config_from_json(const std::string &path, SimConfig &cfg) {
+    std::ifstream in(path);
+    if (!in.is_open()) return false;
+
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const std::string text = buffer.str();
+
+    parse_json_int(text, "n_iterations", cfg.n_iterations);
+    parse_json_bool(text, "export_cartilage", cfg.export_cartilage);
+    parse_json_bool(text, "export_active", cfg.export_active);
+    parse_json_bool(text, "export_trimmed", cfg.export_trimmed);
+
+    parse_json_number(text, "p1_geom", cfg.p1_geom);
+    parse_json_number(text, "p2_geom", cfg.p2_geom);
+    parse_json_number_array(text, "bspline_weights", cfg.bspline_weights);
+    parse_json_int(text, "transfinite_nodes", cfg.transfinite_nodes);
+
+    parse_json_number(text, "interface_y", cfg.interface_y);
+    parse_json_number(text, "oss_height_target", cfg.oss_height_target);
+    parse_json_number(text, "k_mi", cfg.k_mi);
+    parse_json_number(text, "oss_spline_band", cfg.oss_spline_band);
+
+    parse_json_number(text, "load_center_u_frac", cfg.load_center_u_frac);
+    parse_json_number(text, "load_du_frac", cfg.load_du_frac);
+    parse_json_number(text, "load_radius_scale", cfg.load_radius_scale);
+    parse_json_number(text, "load_p_peak", cfg.load_p_peak);
+
+    parse_json_int(text, "mesh_nx", cfg.mesh_nx);
+    parse_json_number(text, "mesh_y_offset", cfg.mesh_y_offset);
+
+    parse_json_string(text, "output_dir", cfg.output_dir);
+    parse_json_string(text, "gmsh_model_name", cfg.gmsh_model_name);
+    return true;
+}
 
 // Geometry
 static constexpr double s = 1.0;
-static constexpr double p1_geom = s * 0.9;
-static constexpr double p2_geom = s * 0.2;
 
 static constexpr double bg_xmin = s * -1.21;
 static constexpr double bg_ymin = 0.0;
@@ -55,7 +179,6 @@ static constexpr double x_bottom_max = s *  0.5;
 static constexpr double y_bottom     = 0.0;
 
 // Material (plane strain)
-static constexpr double interfaceY = s * 1.0;
 
 static constexpr double E_bone  = 500.0, nu_bone = 0.2;
 static constexpr double mu_bone     = E_bone / (2.0 * (1.0 + nu_bone));
@@ -71,14 +194,6 @@ static constexpr double mu_oss     = E_oss / (2.0 * (1.0 + nu_oss));
 static constexpr double lambda_oss = E_oss * nu_oss / ((1.0 + nu_oss) * (1.0 - 2.0 * nu_oss));
 
 // Ossification parameters
-static constexpr double oss_height_target = 0.1;
-static constexpr double kMi = 0.5;
-static constexpr double oss_spline_band = 0.3;
-
-// Load
-static constexpr double load_center_u_frac = 0.50;
-static constexpr double load_du_frac       = 0.08;
-static constexpr double load_p_peak        = 1.0;
 
 struct StepDef { double u_center, u_radius, p_peak; };
 
@@ -153,23 +268,22 @@ static SegmentProjection project_to_polyline_with_u(
 // ============================================================
 static void build_soc_geometry() {
     gmsh::initialize();
-    gmsh::model::add("growth_iterative_cutfem");
+    gmsh::model::add(g_cfg.gmsh_model_name);
 
     gmsh::model::occ::addPoint( s*0.5,  0.0,          0, 0.1, 1);
     gmsh::model::occ::addPoint( s*0.5,  s*1.0,        0, 0.1, 2);
-    gmsh::model::occ::addPoint( s*1.0,  p1_geom,      0, 0.1, 3);
+    gmsh::model::occ::addPoint( s*1.0,  s * g_cfg.p1_geom,      0, 0.1, 3);
     gmsh::model::occ::addPoint( s*1.0,  s*2.4,        0, 0.1, 4);
-    gmsh::model::occ::addPoint( 0.0,    s*2.4+p2_geom,0, 0.1, 5);
+    gmsh::model::occ::addPoint( 0.0,    s*2.4 + s * g_cfg.p2_geom,0, 0.1, 5);
     gmsh::model::occ::addPoint(-s*1.0,  s*2.4,        0, 0.1, 6);
-    gmsh::model::occ::addPoint(-s*1.0,  p1_geom,      0, 0.1, 7);
+    gmsh::model::occ::addPoint(-s*1.0,  s * g_cfg.p1_geom,      0, 0.1, 7);
     gmsh::model::occ::addPoint(-s*0.5,  s*1.0,        0, 0.1, 8);
     gmsh::model::occ::addPoint(-s*0.5,  0.0,          0, 0.1, 9);
 
     gmsh::model::occ::addLine(9, 1, 1);
-    gmsh::model::occ::addBSpline({1,2,3,4,5,6,7,8,9}, 2, 3,
-        {1,2,1,1,1,1,1,2,1});
+    gmsh::model::occ::addBSpline({1,2,3,4,5,6,7,8,9}, 2, 3, g_cfg.bspline_weights);
     gmsh::model::occ::synchronize();
-    gmsh::model::mesh::setTransfiniteCurve(2, 101);
+    gmsh::model::mesh::setTransfiniteCurve(2, g_cfg.transfinite_nodes);
     gmsh::model::mesh::generate(1);
 
     std::vector<std::size_t> tags; std::vector<double> coords, params;
@@ -202,11 +316,15 @@ static void build_soc_geometry() {
 // ============================================================
 static std::vector<StepDef> build_default_steps() {
     double u0 = g_top_u.front(), u1 = g_top_u.back(), ur = u1-u0;
-    double uc = u0 + load_center_u_frac*ur, du = load_du_frac*ur;
+    double uc = u0 + g_cfg.load_center_u_frac * ur;
+    double du = g_cfg.load_du_frac * ur;
+    double radius = std::max(1e-14, g_cfg.load_radius_scale * du);
     std::vector<StepDef> steps = {
-        {uc+2*du, du, 0.50*load_p_peak}, {uc+du, du, 0.75*load_p_peak},
-        {uc,      du, 1.00*load_p_peak}, {uc-du, du, 0.75*load_p_peak},
-        {uc-2*du, du, 0.50*load_p_peak}
+        {uc + 2*du, radius, 0.50 * g_cfg.load_p_peak},
+        {uc + du,   radius, 0.75 * g_cfg.load_p_peak},
+        {uc,        radius, 1.00 * g_cfg.load_p_peak},
+        {uc - du,   radius, 0.75 * g_cfg.load_p_peak},
+        {uc - 2*du, radius, 0.50 * g_cfg.load_p_peak}
     };
     for (auto &st : steps) st.u_center = std::clamp(st.u_center, u0, u1);
     return steps;
@@ -244,7 +362,7 @@ static Invariants compute_invariants(double exx, double eyy, double exy, double 
     double J2 = dxx*dxx + dyy*dyy + dzz*dzz + 2.0*sxy*sxy;
     double vm = std::sqrt(1.5 * J2);
     double oct = std::sqrt(2.0/3.0) * vm;
-    return {vm, hd, oct, oct + kMi*hd};
+    return {vm, hd, oct, oct + g_cfg.k_mi * hd};
 }
 
 // ============================================================
@@ -327,7 +445,7 @@ static double compute_cartilage_area(const space_t &Sh, const mesh_t &Kh) {
         int ndf = FK.NbDoF();
         for (int j = 0; j < ndf; ++j) y_avg += FK.Pt(j).y;
         y_avg /= ndf;
-        if (y_avg < interfaceY) continue;
+        if (y_avg < g_cfg.interface_y) continue;
         R2 P0 = FK.Pt(0), P1 = FK.Pt(1), P2 = FK.Pt(2);
         if (ndf >= 4) {
             R2 P3 = FK.Pt(3);
@@ -357,7 +475,7 @@ static std::vector<std::pair<double,double>> build_axis_profile(
             ymax_e = std::max(ymax_e, P.y);
         }
         if (xmin_e > 0.0 || xmax_e < 0.0) continue;
-        if (ymax_e < interfaceY) continue;
+        if (ymax_e < g_cfg.interface_y) continue;
 
         double hx = xmax_e - xmin_e, hy = ymax_e - ymin_e;
         if (hx < 1e-14 || hy < 1e-14) continue;
@@ -379,7 +497,7 @@ static std::vector<std::pair<double,double>> build_axis_profile(
         for (int ss = 0; ss <= nsamp; ++ss) {
             double eta = (double)ss / nsamp;
             double y_s = ymin_e + eta * hy;
-            if (y_s < interfaceY) continue;
+            if (y_s < g_cfg.interface_y) continue;
             double mi_s = (1-xi)*(1-eta)*mi0 + xi*(1-eta)*mi1
                         + xi*eta*mi2 + (1-xi)*eta*mi3;
             profile.push_back({y_s, mi_s});
@@ -410,15 +528,15 @@ static double find_threshold(const std::vector<double> &mi_nodal,
     }
 
     double a = mi_min_ax, b = mi_max_ax;
-    double fa = compute_oss_height_axis(profile, a) - oss_height_target;
-    double fb = compute_oss_height_axis(profile, b) - oss_height_target;
+    double fa = compute_oss_height_axis(profile, a) - g_cfg.oss_height_target;
+    double fb = compute_oss_height_axis(profile, b) - g_cfg.oss_height_target;
 
     double threshold = 0.5*(a+b);
     for (int iter = 0; iter < 100; ++iter) {
         if (std::abs(fa - fb) < 1e-15) break;
         double c = (a*fb - b*fa) / (fb - fa);
         c = std::clamp(c, mi_min_ax, mi_max_ax);
-        double fc = compute_oss_height_axis(profile, c) - oss_height_target;
+        double fc = compute_oss_height_axis(profile, c) - g_cfg.oss_height_target;
         if (std::abs(fc) < 1e-12) { threshold = c; break; }
 
         if (fc * fa > 0) { a = c; fa = fc; fb *= 0.5; }
@@ -587,14 +705,45 @@ int main(int argc, char **argv) {
     MPIcf cfMPI(argc, argv);
     globalVariable::verbose = 0;
 
-    std::filesystem::create_directories("output_growth_iterative");
+    std::string config_path;
+    if (argc > 1) {
+        config_path = argv[1];
+    } else {
+        const std::string default_path = "configs/growth_iterative_default.json";
+        if (std::filesystem::exists(default_path)) config_path = default_path;
+    }
+
+    if (!config_path.empty()) {
+        if (!load_config_from_json(config_path, g_cfg)) {
+            std::cerr << "Failed to load config file: " << config_path << "\n";
+            return 1;
+        }
+        std::cout << "Loaded config: " << config_path << "\n";
+    } else {
+        std::cout << "No config provided. Using built-in defaults.\n";
+    }
+
+    if (g_cfg.bspline_weights.size() != 9) {
+        std::cerr << "Invalid config: bspline_weights must have exactly 9 values.\n";
+        return 1;
+    }
+    if (g_cfg.n_iterations < 1 || g_cfg.mesh_nx < 2 || g_cfg.transfinite_nodes < 2) {
+        std::cerr << "Invalid config: n_iterations >= 1, mesh_nx >= 2, transfinite_nodes >= 2 are required.\n";
+        return 1;
+    }
+    if (g_cfg.output_dir.empty()) {
+        std::cerr << "Invalid config: output_dir cannot be empty.\n";
+        return 1;
+    }
+
+    std::filesystem::create_directories(g_cfg.output_dir);
     build_soc_geometry();
 
     // ---- Mesh ----
-    const int nx = 200;
+    const int nx = g_cfg.mesh_nx;
     double dx_bg = bg_xmax - bg_xmin, dy_bg = bg_ymax - bg_ymin;
     int ny = static_cast<int>(nx * dy_bg / dx_bg);
-    mesh_t Kh(nx, ny, bg_xmin, bg_ymin - 0.00113, dx_bg, dy_bg);
+    mesh_t Kh(nx, ny, bg_xmin, bg_ymin + g_cfg.mesh_y_offset, dx_bg, dy_bg);
     double h = dx_bg / (nx - 1);
 
     // ---- SOC boundary level set ----
@@ -637,7 +786,7 @@ int main(int argc, char **argv) {
             if (iglo < 0 || iglo >= nb_sca) continue;
             R2 P = FK.Pt(j);
             phi_outer_data[iglo] = signed_distance_polygon(P, g_polygon);
-            phi_iface_data[iglo] = P.y - interfaceY;
+            phi_iface_data[iglo] = P.y - g_cfg.interface_y;
         }
     }
     std::span<double> phi_outer_span(phi_outer_data);
@@ -738,16 +887,12 @@ int main(int argc, char **argv) {
     {
         std::string tag = std::to_string(iter);
 
-        // phi_soc level set FE function
-        std::span<double> phi_soc_span_loc(const_cast<double*>(phi_oss_data.data()), phi_oss_data.size());
-        // phi_soc_fh is already built by the caller
-
         // Per-step outputs
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
             std::span<double> sp(const_cast<double*>(result.all_sols[sidx].data()),
                                  result.all_sols[sidx].size());
             fct_t uh(Wh, sp);
-            Paraview<mesh_t> w(Khi, "output_growth_iterative/growth_" + tag + "-step-" + std::to_string(sidx+1) + ".vtk");
+            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/growth_" + tag + "-step-" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
@@ -756,7 +901,7 @@ int main(int argc, char **argv) {
 
         // Fields (trimmed at SOC boundary)
         {
-            Paraview<mesh_t> w(Khi, "output_growth_iterative/growth-fields_" + tag + ".vtk");
+            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/growth-fields_" + tag + ".vtk");
             w.add(const_cast<fct_t&>(uh_avg), "displacement", 0, 2);
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
@@ -768,9 +913,9 @@ int main(int argc, char **argv) {
         }
 
         // Active elements (full quads)
-        if (EXPORT_ACTIVE) {
+        if (g_cfg.export_active) {
             Paraview<mesh_t> w;
-            w.writeActiveMesh(Khi, "output_growth_iterative/growth-active_" + tag + ".vtk");
+            w.writeActiveMesh(Khi, g_cfg.output_dir + "/growth-active_" + tag + ".vtk");
             w.add(const_cast<fct_t&>(uh_avg), "displacement", 0, 2);
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
@@ -782,10 +927,10 @@ int main(int argc, char **argv) {
         }
 
         // Trimmed both sides
-        if (EXPORT_TRIMMED) {
+        if (g_cfg.export_trimmed) {
         std::vector<PhiFn> clip_levelsets = {
             [](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
-            [](const R2& P, int) { return P.y - interfaceY; }
+            [](const R2& P, int) { return P.y - g_cfg.interface_y; }
         };
         if (iter > 0) {
             clip_levelsets.push_back(
@@ -807,18 +952,18 @@ int main(int argc, char **argv) {
         CellFn mat_sharp;
         if (iter == 0) {
             mat_sharp = {[](const R2& P, int) -> double {
-                return P.y < interfaceY ? 0.0 : 1.0;
+                return P.y < g_cfg.interface_y ? 0.0 : 1.0;
             }, "material_sharp"};
         } else {
             mat_sharp = {[&phi_soc_fh](const R2& P, int kb) -> double {
-                if (P.y < interfaceY) return 0.0;
+                if (P.y < g_cfg.interface_y) return 0.0;
                 if (phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0) return 2.0;
                 return 1.0;
             }, "material_sharp"};
         }
 
         write_trimmed_both_vtk(
-            "output_growth_iterative/growth-trimmed_" + tag + ".vtk", Khi,
+            g_cfg.output_dir + "/growth-trimmed_" + tag + ".vtk", Khi,
             clip_levelsets, sca,
             {{const_cast<fct_t*>(&mat_fh), "material"}},
             {mat_sharp},
@@ -826,7 +971,7 @@ int main(int argc, char **argv) {
         }
 
         // Cartilage only
-        if (EXPORT_CARTILAGE) {
+        if (g_cfg.export_cartilage) {
             std::vector<double> phi_cart_data(nb_sca);
             for (int k = 0; k < Kh.nt; ++k) {
                 const auto &FK = Sh[k];
@@ -835,7 +980,7 @@ int main(int argc, char **argv) {
                     if (iglo < 0 || iglo >= nb_sca) continue;
                     R2 P = FK.Pt(j);
                     double phi_out = signed_distance_polygon(P, g_polygon);
-                    double phi_y   = interfaceY - P.y;
+                    double phi_y   = g_cfg.interface_y - P.y;
                     double phi_c   = std::max(phi_out, phi_y);
                     if (iter > 0) phi_c = std::max(phi_c, phi_oss_data[iglo]);
                     phi_cart_data[iglo] = phi_c;
@@ -848,7 +993,7 @@ int main(int argc, char **argv) {
             cutmesh_t Khi_cart(Kh);
             Khi_cart.truncate(cart_interface, 1);
 
-            Paraview<mesh_t> w(Khi_cart, "output_growth_iterative/growth-cartilage_" + tag + ".vtk");
+            Paraview<mesh_t> w(Khi_cart, g_cfg.output_dir + "/growth-cartilage_" + tag + ".vtk");
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);
@@ -870,7 +1015,7 @@ int main(int argc, char **argv) {
     std::vector<double> prev_mi_avg(nb_sca, 0.0);       // MI from previous iteration
     double prev_threshold = 0.0;                         // threshold from previous iteration
 
-    for (int iter = 0; iter < N_ITERATIONS; ++iter) {
+    for (int iter = 0; iter < g_cfg.n_iterations; ++iter) {
         std::cout << "\n=== Iteration " << iter << " ===\n";
 
         // Build material coefficients for this iteration:
@@ -897,7 +1042,7 @@ int main(int argc, char **argv) {
                     int iglo = Sh(k, j);
                     if (iglo < 0 || iglo >= nb_sca) continue;
                     R2 P = FK.Pt(j);
-                    if (P.y < interfaceY) {
+                    if (P.y < g_cfg.interface_y) {
                         tmu_data[iglo] = 2.0 * mu_bone;
                         lam_data[iglo] = lambda_bone;
                         mat_data[iglo] = 0.0; // bone
@@ -930,7 +1075,7 @@ int main(int argc, char **argv) {
                     int iglo = Sh(k, j);
                     if (iglo < 0 || iglo >= nb_sca) continue;
                     R2 P = FK.Pt(j);
-                    if (P.y < interfaceY || matured[iglo]) {
+                    if (P.y < g_cfg.interface_y || matured[iglo]) {
                         tmu_data[iglo] = 2.0 * mu_bone;
                         lam_data[iglo] = lambda_bone;
                         mat_data[iglo] = 0.0; // bone
@@ -952,11 +1097,11 @@ int main(int argc, char **argv) {
                     if (iglo < 0 || iglo >= nb_sca) continue;
                     R2 P = FK.Pt(j);
                     double dist = std::abs(signed_distance_polygon(P, g_polygon));
-                    double t = std::clamp(dist / oss_spline_band, 0.0, 1.0);
+                    double t = std::clamp(dist / g_cfg.oss_spline_band, 0.0, 1.0);
                     double inhibition = t * t * (3.0 - 2.0 * t);
                     inhibition_data[iglo] = inhibition;
                     // Exclude already-matured nodes from new ossification
-                    if (matured[iglo] || P.y < interfaceY)
+                    if (matured[iglo] || P.y < g_cfg.interface_y)
                         phi_oss_data[iglo] = -1.0; // not a candidate
                     else
                         phi_oss_data[iglo] = prev_mi_avg[iglo] * inhibition - prev_threshold;
@@ -970,7 +1115,7 @@ int main(int argc, char **argv) {
                 for (int j = 0; j < FK.NbDoF(); ++j) {
                     int iglo = Sh(k, j);
                     if (iglo < 0 || iglo >= nb_sca) continue;
-                    if (phi_oss_data[iglo] >= 0.0 && FK.Pt(j).y >= interfaceY && !matured[iglo]) {
+                    if (phi_oss_data[iglo] >= 0.0 && FK.Pt(j).y >= g_cfg.interface_y && !matured[iglo]) {
                         tmu_data[iglo] = 2.0 * mu_oss;
                         lam_data[iglo] = lambda_oss;
                         mat_data[iglo] = 2.0; // ossified (intermediate)
@@ -1022,6 +1167,6 @@ int main(int argc, char **argv) {
         std::cout << "  Iteration " << iter << " done.\n";
     }
 
-    std::cout << "\nDone. Output in output_growth_iterative/\n";
+    std::cout << "\nDone. Output in " << g_cfg.output_dir << "/\n";
     return 0;
 }

@@ -46,7 +46,6 @@ cmake --build build --target step85_cutfem -j
 cmake --build build --target SOC_cutfem -j
 cmake --build build --target growth_cutfem -j
 cmake --build build --target growth_iterative_cutfem -j
-cmake --build build --target growth_iterative_12_cutfem -j
 ```
 
 ### Clean
@@ -65,7 +64,8 @@ cmake --build build --target clean
 ./build/growth_cutfem export
 ./build/growth_cutfem import
 ./build/growth_iterative_cutfem
-./build/growth_iterative_12_cutfem
+./build/growth_iterative_cutfem configs/growth_iterative_default.json
+./build/growth_iterative_cutfem configs/growth_iterative_soc12.json
 ```
 - Most outputs go under `build/output_*`.
 

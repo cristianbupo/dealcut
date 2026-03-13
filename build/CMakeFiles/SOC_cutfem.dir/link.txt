@@ -1,1 +1,0 @@
-/usr/bin/mpicxx -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/SOC_cutfem.dir/link.d CMakeFiles/SOC_cutfem.dir/SOC_cutfem.cpp.o -o SOC_cutfem   -L/home/crist/git/CutFEM-Library/build/lib  -Wl,-rpath,/home/crist/git/CutFEM-Library/build/lib -lparallel -lcommon -lFESpace -lsolver -lproblem /lib/x86_64-linux-gnu/libgmsh.so

@@ -1,0 +1,14 @@
+build/
+
+# Simulation outputs
+output_*/
+*.vtk
+*.vtu
+*.pvtu
+*.pvd
+*.png
+*.pdf
+*.mp4
+
+# CMake helpers
+compile_commands.json

@@ -1,1 +1,0 @@
-/usr/bin/mpicxx -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/step85_cutfem.dir/link.d CMakeFiles/step85_cutfem.dir/step85_cutfem.cpp.o -o step85_cutfem   -L/home/crist/git/CutFEM-Library/build/lib  -Wl,-rpath,/home/crist/git/CutFEM-Library/build/lib -lparallel -lcommon -lFESpace -lsolver -lproblem
