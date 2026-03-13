@@ -1,6 +1,7 @@
 build/
 
 # Simulation outputs
+output/
 output_*/
 *.vtk
 *.vtu

@@ -25,7 +25,8 @@ endif()
 # Target 2: SOC (deal.II + VTK + Gmsh)
 # ===========================================================
 if(${deal.II_FOUND} AND DEAL_II_WITH_LAPACK)
-  find_package(VTK QUIET)
+  # Request only the VTK modules used by SOC/growth to avoid optional Qt GUI deps.
+  find_package(VTK QUIET COMPONENTS CommonCore CommonDataModel IOXML)
   find_path(GMSH_INCLUDE_DIR gmsh.h HINTS /usr/include)
   find_library(GMSH_LIBRARY gmsh HINTS /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
 
