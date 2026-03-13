@@ -67,7 +67,7 @@ cmake --build build --target clean
 ./build/growth_iterative_cutfem configs/growth_iterative_default.json
 ./build/growth_iterative_cutfem configs/growth_iterative_soc12.json
 ```
-- Most outputs go under `build/output_*`.
+- Most outputs go under `output/*`.
 
 ## 5) Test Commands
 - Current state: no `enable_testing()` / `add_test()` in `CMakeLists.txt`.

@@ -17,6 +17,6 @@
   "load_p_peak": 1.0,
   "mesh_nx": 200,
   "mesh_y_offset": -0.00113,
-  "output_dir": "output_growth_iterative_12",
+  "output_dir": "output/growth_iterative_12",
   "gmsh_model_name": "growth_iterative_soc12_cutfem"
 }

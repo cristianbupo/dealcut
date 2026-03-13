@@ -3,8 +3,8 @@
 // SOC geometry kept (gmsh curve nodes).
 // Growth/ossification pattern:
 //  - 5-step moving Neumann window (CONTINUOUS, parametric-spline based)
-//  - per-step outputs:  output_growth/growth-step-i.vtu
-//  - averaged output:   output_growth/growth.vtu
+//  - per-step outputs:  output/growth/growth_iter_k_step_i.vtu
+//  - averaged output:   output/growth/growth_iter_k_averaged.vtu
 // Also improves convergence:
 //  - tighter CG tolerance
 //  - SSOR preconditioner for stiffness matrix
@@ -989,13 +989,13 @@ class ImmersedElasticity
   template <int dim>
   std::string ImmersedElasticity<dim>::tagged_prefix() const
   {
-    return "output_growth/" + prefix + "_" + std::to_string(iteration_id);
+    return "output/growth/" + prefix + "_iter_" + std::to_string(iteration_id);
   }
 
   template <int dim>
   std::string ImmersedElasticity<dim>::restart_filename(const unsigned int id) const
   {
-    return "output_growth/" + prefix + "_restart_" + std::to_string(id) + ".dat";
+    return "output/growth/" + prefix + "_restart_" + std::to_string(id) + ".dat";
   }
 
   template <int dim>
@@ -2424,7 +2424,7 @@ class ImmersedElasticity
   template <int dim>
   void ImmersedElasticity<dim>::run()
   {
-    std::filesystem::create_directories("output_growth");
+    std::filesystem::create_directories("output/growth");
 
     make_background_grid();
     build_geometry_from_gmsh_curve_nodes();
@@ -2480,7 +2480,7 @@ class ImmersedElasticity
 
         // output step
         const std::string step_base =
-          tagged_prefix() + "-step-" + std::to_string(sidx + 1);
+          tagged_prefix() + "_step_" + std::to_string(sidx + 1);
         output_one(step_base,
                    U, von_mises, octShearS, hydroD, mi,
                    vm_cell, os_cell, hd_cell, mi_cell,
@@ -2562,7 +2562,7 @@ class ImmersedElasticity
 
     fill_cell_outputs_static();
 
-    output_one(tagged_prefix(),
+    output_one(tagged_prefix() + "_averaged",
                U_avg, vm_avg, os_avg, hd_avg, mi_avg,
                vm_cell_avg, os_cell_avg, hd_cell_avg, mi_cell_avg,
                p_cell_avg);

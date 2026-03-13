@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
 
     std::vector<double> L2_errors, H1_errors, hs;
 
-    std::filesystem::create_directories("output_step85_cutfem");
+    std::filesystem::create_directories("output/step85_cutfem");
 
     std::cout << std::string(60, '=') << "\n";
     std::cout << "Step-85 CutFEM-Library: Poisson on unit disk\n";
@@ -176,7 +176,7 @@ int main(int argc, char **argv) {
         // ---- Paraview output ----
         {
             Paraview<mesh_t> writer(Khi,
-                "output_step85_cutfem/step85_cutfem_cycle" + std::to_string(cycle) + ".vtk");
+                "output/step85_cutfem/step85_cutfem_cycle_" + std::to_string(cycle) + ".vtk");
             writer.add(uh, "solution", 0, 1);
             writer.add(u_ex, "exact_solution", 0, 1);
         }

@@ -588,8 +588,8 @@ namespace Step85
       });
 
     data_out.build_patches();
-    std::filesystem::create_directories("output_step85");
-    std::ofstream output("output_step85/step-85_cycle" + std::to_string(cycle) + ".vtu");
+    std::filesystem::create_directories("output/step85");
+    std::ofstream output("output/step85/step85_cycle_" + std::to_string(cycle) + ".vtu");
     data_out.write_vtu(output);
   }
 

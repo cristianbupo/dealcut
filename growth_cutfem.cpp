@@ -519,7 +519,7 @@ static double find_threshold(const std::vector<double> &mi_nodal,
 // Restart file I/O
 // ============================================================
 static std::string restart_filename(unsigned int id) {
-    return "output_growth_cutfem/growth_cutfem_restart_" + std::to_string(id) + ".dat";
+    return "output/growth_cutfem/growth_cutfem_restart_" + std::to_string(id) + ".dat";
 }
 
 static void save_restart(const std::vector<double> &mi_avg, double threshold, unsigned int id) {
@@ -712,7 +712,7 @@ int main(int argc, char **argv) {
         else { std::cerr << "Usage: " << argv[0] << " [export|import]\n"; return 1; }
     }
 
-    std::filesystem::create_directories("output_growth_cutfem");
+    std::filesystem::create_directories("output/growth_cutfem");
     build_soc_geometry();
 
     // ---- Mesh ----
@@ -883,7 +883,7 @@ int main(int argc, char **argv) {
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
             std::span<double> sp(result.all_sols[sidx]);
             fct_t uh(Wh, sp);
-            Paraview<mesh_t> w(Khi, "output_growth_cutfem/growth_0-step-" + std::to_string(sidx+1) + ".vtk");
+            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_0_step_" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
             w.add(phi_soc_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
@@ -918,7 +918,7 @@ int main(int argc, char **argv) {
 
         // Trimmed (cut polygons at SOC boundary)
         {
-            Paraview<mesh_t> w(Khi, "output_growth_cutfem/growth-fields_0.vtk");
+            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_fields_0.vtk");
             w.add(uh_avg, "displacement", 0, 2);
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
@@ -932,7 +932,7 @@ int main(int argc, char **argv) {
         // Active elements (full quads)
         {
             Paraview<mesh_t> w;
-            w.writeActiveMesh(Khi, "output_growth_cutfem/growth-active_0.vtk");
+            w.writeActiveMesh(Khi, "output/growth_cutfem/growth_cutfem_active_0.vtk");
             w.add(uh_avg, "displacement", 0, 2);
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
@@ -945,7 +945,7 @@ int main(int argc, char **argv) {
 
         // Trimmed both sides (SOC boundary + bone/cartilage interface)
         write_trimmed_both_vtk(
-            "output_growth_cutfem/growth-trimmed_0.vtk", Khi,
+            "output/growth_cutfem/growth_cutfem_trimmed_0.vtk", Khi,
             {[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
              [](const R2& P, int) { return P.y - interfaceY; }},
             {{&hd_fh, "hydrostatic"}, {&oct_fh, "oct_shear"},
@@ -978,7 +978,7 @@ int main(int argc, char **argv) {
             cutmesh_t Khi_cart(Kh);
             Khi_cart.truncate(cart_interface, 1);
 
-            Paraview<mesh_t> w(Khi_cart, "output_growth_cutfem/growth-cartilage_0.vtk");
+            Paraview<mesh_t> w(Khi_cart, "output/growth_cutfem/growth_cutfem_cartilage_0.vtk");
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
             w.add(mi_fh, "miner_index", 0, 1);
@@ -1096,7 +1096,7 @@ int main(int argc, char **argv) {
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
             std::span<double> sp(result.all_sols[sidx]);
             fct_t uh(Wh, sp);
-            Paraview<mesh_t> w(Khi, "output_growth_cutfem/growth_1-step-" + std::to_string(sidx+1) + ".vtk");
+            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_1_step_" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
             w.add(phi_soc_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
@@ -1119,7 +1119,7 @@ int main(int argc, char **argv) {
 
         // Trimmed (cut polygons at SOC boundary)
         {
-            Paraview<mesh_t> w(Khi, "output_growth_cutfem/growth-fields_1.vtk");
+            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_fields_1.vtk");
             w.add(uh_avg, "displacement", 0, 2);
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
@@ -1134,7 +1134,7 @@ int main(int argc, char **argv) {
         // Active elements (full quads)
         {
             Paraview<mesh_t> w;
-            w.writeActiveMesh(Khi, "output_growth_cutfem/growth-active_1.vtk");
+            w.writeActiveMesh(Khi, "output/growth_cutfem/growth_cutfem_active_1.vtk");
             w.add(uh_avg, "displacement", 0, 2);
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
@@ -1148,7 +1148,7 @@ int main(int argc, char **argv) {
 
         // Trimmed both sides (SOC boundary + bone/cartilage interface + ossification front)
         write_trimmed_both_vtk(
-            "output_growth_cutfem/growth-trimmed_1.vtk", Khi,
+            "output/growth_cutfem/growth_cutfem_trimmed_1.vtk", Khi,
             {[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
              [](const R2& P, int) { return P.y - interfaceY; },
              [&phi_oss](const R2& P, int kb) { return phi_oss.evalOnBackMesh(kb, 0, &P.x, 0, 0); }},
@@ -1186,7 +1186,7 @@ int main(int argc, char **argv) {
             cutmesh_t Khi_cart(Kh);
             Khi_cart.truncate(cart_interface, 1);
 
-            Paraview<mesh_t> w(Khi_cart, "output_growth_cutfem/growth-cartilage_1.vtk");
+            Paraview<mesh_t> w(Khi_cart, "output/growth_cutfem/growth_cutfem_cartilage_1.vtk");
             w.add(hd_fh, "hydrostatic", 0, 1);
             w.add(oct_fh, "oct_shear", 0, 1);
             w.add(mi_fh, "miner_index", 0, 1);
@@ -1200,6 +1200,6 @@ int main(int argc, char **argv) {
         std::cout << "Import done.\n";
     }
 
-    std::cout << "\nDone. Output in output_growth_cutfem/\n";
+    std::cout << "\nDone. Output in output/growth_cutfem/\n";
     return 0;
 }

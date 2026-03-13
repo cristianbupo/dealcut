@@ -13,3 +13,14 @@ output_*/
 
 # CMake helpers
 compile_commands.json
+
+# Notes folder
+notes/
+
+# Python virtual environments
+.venv/
+src/.venv/
+
+# Python cache
+__pycache__/
+*.pyc

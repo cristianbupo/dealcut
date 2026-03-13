@@ -3,8 +3,8 @@
 // SOC geometry kept (gmsh curve nodes).
 // Adds SOC pattern:
 //  - 5-step moving Neumann window (NOW CONTINUOUS, parametric-spline based)
-//  - per-step outputs:  output_SOC/SOC-step-i.vtu
-//  - averaged output:   output_SOC/SOC.vtu
+//  - per-step outputs:  output/SOC/SOC_step_i.vtu
+//  - averaged output:   output/SOC/SOC_averaged.vtu
 // Also improves convergence:
 //  - tighter CG tolerance
 //  - SSOR preconditioner for stiffness matrix
@@ -608,7 +608,7 @@ namespace SOC
     std::vector<double>   top_u;
 
     // output prefix
-    const std::string prefix = "output_SOC/SOC";
+    const std::string prefix = "output/SOC/SOC";
   };
 
   enum ActiveFEIndex
@@ -1556,7 +1556,7 @@ namespace SOC
     fill_cell_outputs_static();
     build_phi_nodal();
 
-    std::filesystem::create_directories("output_SOC");
+    std::filesystem::create_directories("output/SOC");
 
     // assemble once
     assemble_stiffness();
@@ -1590,7 +1590,7 @@ namespace SOC
         solve_scalar_systems();
 
         // output step
-        const std::string step_base = prefix + "-step-" + std::to_string(sidx + 1);
+        const std::string step_base = prefix + "_step_" + std::to_string(sidx + 1);
         output_one(step_base,
                    U, von_mises, octShearS, hydroD, mi,
                    vm_cell, os_cell, hd_cell, mi_cell,
@@ -1653,7 +1653,7 @@ namespace SOC
         cell_pressure_dealii[c] = static_cast<float>(p_cell_avg[c]);
       }
 
-    output_one(prefix,
+    output_one(prefix + "_averaged",
                U_avg, vm_avg, os_avg, hd_avg, mi_avg,
                vm_cell_avg, os_cell_avg, hd_cell_avg, mi_cell_avg,
                p_cell_avg);

@@ -63,7 +63,7 @@ struct SimConfig {
     int mesh_nx = 200;
     double mesh_y_offset = -0.00113;
 
-    std::string output_dir = "output_growth_iterative";
+    std::string output_dir = "output/growth_iterative";
     std::string gmsh_model_name = "growth_iterative_cutfem";
 };
 
@@ -886,13 +886,15 @@ int main(int argc, char **argv) {
                                 const std::vector<double> &phi_oss_data)
     {
         std::string tag = std::to_string(iter);
+        const std::string output_prefix = std::filesystem::path(g_cfg.output_dir).filename().string();
+        const std::string iter_prefix = output_prefix + "_iter_" + tag;
 
         // Per-step outputs
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
             std::span<double> sp(const_cast<double*>(result.all_sols[sidx].data()),
                                  result.all_sols[sidx].size());
             fct_t uh(Wh, sp);
-            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/growth_" + tag + "-step-" + std::to_string(sidx+1) + ".vtk");
+            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/" + iter_prefix + "_step_" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
@@ -901,7 +903,7 @@ int main(int argc, char **argv) {
 
         // Fields (trimmed at SOC boundary)
         {
-            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/growth-fields_" + tag + ".vtk");
+            Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/" + iter_prefix + "_fields.vtk");
             w.add(const_cast<fct_t&>(uh_avg), "displacement", 0, 2);
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
@@ -915,7 +917,7 @@ int main(int argc, char **argv) {
         // Active elements (full quads)
         if (g_cfg.export_active) {
             Paraview<mesh_t> w;
-            w.writeActiveMesh(Khi, g_cfg.output_dir + "/growth-active_" + tag + ".vtk");
+            w.writeActiveMesh(Khi, g_cfg.output_dir + "/" + iter_prefix + "_active.vtk");
             w.add(const_cast<fct_t&>(uh_avg), "displacement", 0, 2);
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
@@ -963,7 +965,7 @@ int main(int argc, char **argv) {
         }
 
         write_trimmed_both_vtk(
-            g_cfg.output_dir + "/growth-trimmed_" + tag + ".vtk", Khi,
+            g_cfg.output_dir + "/" + iter_prefix + "_trimmed.vtk", Khi,
             clip_levelsets, sca,
             {{const_cast<fct_t*>(&mat_fh), "material"}},
             {mat_sharp},
@@ -993,7 +995,7 @@ int main(int argc, char **argv) {
             cutmesh_t Khi_cart(Kh);
             Khi_cart.truncate(cart_interface, 1);
 
-            Paraview<mesh_t> w(Khi_cart, g_cfg.output_dir + "/growth-cartilage_" + tag + ".vtk");
+            Paraview<mesh_t> w(Khi_cart, g_cfg.output_dir + "/" + iter_prefix + "_cartilage.vtk");
             w.add(const_cast<fct_t&>(hd_fh), "hydrostatic", 0, 1);
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);

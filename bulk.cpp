@@ -428,8 +428,8 @@ int main(int argc, char **argv) {
     assert(delta > 0. && delta <= 1.);
     
     // Data file to hold problem data
-    std::filesystem::create_directories("output_bulk");
-    std::ofstream output_data("output_bulk/output_bulk.dat", std::ofstream::out);
+    std::filesystem::create_directories("output/bulk");
+    std::ofstream output_data("output/bulk/bulk_results.dat", std::ofstream::out);
     output_data << "Example: " << example << "\n";
     output_data << "Method: " << method << "\n";
     output_data << "Polynomial order time: " << k << "\n";
@@ -687,7 +687,7 @@ int main(int argc, char **argv) {
 
             // Paraview output
             {
-                Paraview<mesh_t> writer(Thi, "output_bulk/bulk_j" + std::to_string(j) + "_t" + std::to_string(iter) + ".vtk");
+                Paraview<mesh_t> writer(Thi, "output/bulk/bulk_j" + std::to_string(j) + "_t" + std::to_string(iter) + ".vtk");
                 writer.add(funuh, "uh", 0, 1);
                 writer.add(u_exact, "u_exact", 0, 1);
                 writer.add(fabs(funuh.expr() - u_exact.expr()), "error");

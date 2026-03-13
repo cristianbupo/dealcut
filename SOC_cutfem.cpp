@@ -391,7 +391,7 @@ int main(int argc, char **argv) {
     MPIcf cfMPI(argc, argv);
     globalVariable::verbose = 0;
 
-    std::filesystem::create_directories("output_SOC_cutfem");
+    std::filesystem::create_directories("output/SOC_cutfem");
 
     // Build SOC geometry
     build_soc_geometry();
@@ -515,7 +515,7 @@ int main(int argc, char **argv) {
             std::span<double> sol_span(sol_data);
             fct_t uh(Wh, sol_span);
 
-            std::string fname = "output_SOC_cutfem/SOC-step-" +
+            std::string fname = "output/SOC_cutfem/SOC_cutfem_step_" +
                                 std::to_string(sidx + 1) + ".vtk";
             Paraview<mesh_t> writer(Khi, fname);
             writer.add(uh, "displacement", 0, 2);
@@ -534,10 +534,10 @@ int main(int argc, char **argv) {
         std::span<double> avg_span(U_avg);
         fct_t uh_avg(Wh, avg_span);
 
-        Paraview<mesh_t> writer(Khi, "output_SOC_cutfem/SOC-averaged.vtk");
+        Paraview<mesh_t> writer(Khi, "output/SOC_cutfem/SOC_cutfem_averaged.vtk");
         writer.add(uh_avg, "displacement", 0, 2);
     }
 
-    std::cout << "\nDone. Output in output_SOC_cutfem/\n";
+    std::cout << "\nDone. Output in output/SOC_cutfem/\n";
     return 0;
 }
