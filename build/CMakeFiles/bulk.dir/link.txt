@@ -1,0 +1,1 @@
+/usr/bin/mpicxx -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/bulk.dir/link.d CMakeFiles/bulk.dir/bulk.cpp.o -o bulk   -L/home/crist/git/CutFEM-Library/build/lib  -Wl,-rpath,/home/crist/git/CutFEM-Library/build/lib -lparallel -lcommon -lFESpace -lsolver -lproblem
