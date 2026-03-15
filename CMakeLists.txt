@@ -182,8 +182,31 @@ if(EXISTS "${CUTFEM_DIR}/cpp/cutfem.hpp" AND EXISTS "${CUTFEM_BUILD_DIR}/lib")
     target_link_directories(growth_iterative_cutfem PRIVATE ${CUTFEM_BUILD_DIR}/lib)
     target_link_libraries(growth_iterative_cutfem PRIVATE parallel common FESpace solver problem ${GMSH_LIBRARY})
 
+    # growth_iterative_lowner_cutfem: Iterative ossification with Lowner ellipse front
+    add_executable(growth_iterative_lowner_cutfem growth_iterative_lowner_cutfem.cpp)
+    set_target_properties(growth_iterative_lowner_cutfem PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+    )
+    target_include_directories(growth_iterative_lowner_cutfem PRIVATE
+      ${CUTFEM_DIR}
+      ${CUTFEM_DIR}/cpp
+      ${CUTFEM_DIR}/cpp/problem
+      ${CUTFEM_DIR}/cpp/FESpace
+      ${CUTFEM_DIR}/cpp/common
+      ${CUTFEM_DIR}/cpp/solver
+      ${CUTFEM_DIR}/cpp/parallel
+      ${CUTFEM_DIR}/cpp/num
+      ${CUTFEM_DIR}/cpp/algoim
+      ${CUTFEM_DIR}/cpp/concept
+      ${CUTFEM_BUILD_DIR}
+      ${GMSH_INCLUDE_DIR}
+    )
+    target_link_directories(growth_iterative_lowner_cutfem PRIVATE ${CUTFEM_BUILD_DIR}/lib)
+    target_link_libraries(growth_iterative_lowner_cutfem PRIVATE parallel common FESpace solver problem ${GMSH_LIBRARY})
+
   else()
-    message(STATUS "Gmsh not found — skipping SOC_cutfem, growth_cutfem, growth_iterative_cutfem")
+    message(STATUS "Gmsh not found — skipping SOC_cutfem, growth_cutfem, growth_iterative_cutfem, growth_iterative_lowner_cutfem")
   endif()
 else()
   message(STATUS "CutFEM-Library not found at ${CUTFEM_DIR} — skipping bulk, step85_cutfem, SOC_cutfem")

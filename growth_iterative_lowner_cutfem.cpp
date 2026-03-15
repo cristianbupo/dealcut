@@ -26,6 +26,8 @@
 #include <functional>
 #include <regex>
 #include <sstream>
+#include <array>
+#include <limits>
 
 using mesh_t     = MeshQuad2;
 using funtest_t  = TestFunction<mesh_t>;
@@ -53,6 +55,16 @@ struct SimConfig {
     double k_mi = 0.5;
     double oss_spline_band = 0.3;
 
+    std::string ellipse_mode = "outer_mvee";
+    double ellipse_active_quantile = 0.9;
+    double ellipse_threshold_scale = 1.0;
+    double ellipse_dilation = 1.05;
+    int ellipse_min_points = 8;
+    double ellipse_max_aspect = 6.0;
+    bool ellipse_use_inhibition = true;
+    bool ellipse_use_interface_inhibition = true;
+    double ellipse_interface_band = 0.15;
+
     double load_center_u_frac = 0.50;
     double load_du_frac = 0.08;
     double load_radius_scale = 1.0;
@@ -61,8 +73,8 @@ struct SimConfig {
     int mesh_nx = 200;
     double mesh_y_offset = -0.00113;
 
-    std::string output_dir = "output/growth_iterative";
-    std::string gmsh_model_name = "growth_iterative_cutfem";
+    std::string output_dir = "output/growth_iterative_lowner";
+    std::string gmsh_model_name = "growth_iterative_lowner_cutfem";
 };
 
 static SimConfig g_cfg;
@@ -150,6 +162,16 @@ static bool load_config_from_json(const std::string &path, SimConfig &cfg) {
     parse_json_number(text, "oss_height_target", cfg.oss_height_target);
     parse_json_number(text, "k_mi", cfg.k_mi);
     parse_json_number(text, "oss_spline_band", cfg.oss_spline_band);
+
+    parse_json_string(text, "ellipse_mode", cfg.ellipse_mode);
+    parse_json_number(text, "ellipse_active_quantile", cfg.ellipse_active_quantile);
+    parse_json_number(text, "ellipse_threshold_scale", cfg.ellipse_threshold_scale);
+    parse_json_number(text, "ellipse_dilation", cfg.ellipse_dilation);
+    parse_json_int(text, "ellipse_min_points", cfg.ellipse_min_points);
+    parse_json_number(text, "ellipse_max_aspect", cfg.ellipse_max_aspect);
+    parse_json_bool(text, "ellipse_use_inhibition", cfg.ellipse_use_inhibition);
+    parse_json_bool(text, "ellipse_use_interface_inhibition", cfg.ellipse_use_interface_inhibition);
+    parse_json_number(text, "ellipse_interface_band", cfg.ellipse_interface_band);
 
     parse_json_number(text, "load_center_u_frac", cfg.load_center_u_frac);
     parse_json_number(text, "load_du_frac", cfg.load_du_frac);
@@ -400,10 +422,6 @@ static StressFields compute_stress_fields(
         double lam = lambda_fh.evalOnBackMesh(kb, 0, centroid, 0, 0);
         double mu  = two_mu_fh.evalOnBackMesh(kb, 0, centroid, 0, 0) * 0.5;
 
-        // MI is only meaningful in cartilage; skip bone elements (full and cut)
-        static constexpr double lam_mid = 0.5 * (lambda_bone + lambda_cart);
-        if (lam > lam_mid) continue;
-
         auto inv = compute_invariants(exx, eyy, exy, lam, mu);
 
         for (int j = 0; j < ndf; ++j) {
@@ -549,6 +567,304 @@ static double find_threshold(const std::vector<double> &mi_nodal,
     return threshold;
 }
 
+static double compute_interface_min_threshold(
+    const std::vector<double> &mi_nodal,
+    const std::vector<double> &mat_nodal,
+    const space_t &Sh,
+    const mesh_t &Kh)
+{
+    std::vector<char> on_bc_interface_cart(mi_nodal.size(), 0);
+    std::vector<R2> node_points(mi_nodal.size(), R2(0.0, 0.0));
+    std::vector<char> node_seen(mi_nodal.size(), 0);
+
+    for (int k = 0; k < Kh.nt; ++k) {
+        const auto &FK = Sh[k];
+        bool has_cart = false;
+        bool has_bone = false;
+
+        for (int j = 0; j < FK.NbDoF(); ++j) {
+            const int iglo = Sh(k, j);
+            if (iglo < 0 || iglo >= static_cast<int>(mi_nodal.size())) continue;
+            if (!node_seen[iglo]) {
+                node_points[iglo] = FK.Pt(j);
+                node_seen[iglo] = 1;
+            }
+            const double m = mat_nodal[iglo];
+            if (m > 0.5) has_bone = true;
+            if (m < 0.5) has_cart = true;
+        }
+
+        if (!(has_cart && has_bone)) continue;
+
+        for (int j = 0; j < FK.NbDoF(); ++j) {
+            const int iglo = Sh(k, j);
+            if (iglo < 0 || iglo >= static_cast<int>(mi_nodal.size())) continue;
+            const double m = mat_nodal[iglo];
+            if (m < 0.5) on_bc_interface_cart[iglo] = 1;
+        }
+    }
+
+    double mi_eff_min = std::numeric_limits<double>::infinity();
+    int n_if_nodes = 0;
+    for (int i = 0; i < static_cast<int>(mi_nodal.size()); ++i) {
+        if (!on_bc_interface_cart[i]) continue;
+        const double v = mi_nodal[i];
+        if (!std::isfinite(v)) continue;
+        mi_eff_min = std::min(mi_eff_min, v);
+        ++n_if_nodes;
+    }
+
+    if (n_if_nodes == 0 || !std::isfinite(mi_eff_min)) {
+        double mi_eff_cart_min = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < static_cast<int>(mi_nodal.size()); ++i) {
+            const double m = mat_nodal[i];
+            if (!(m < 0.5)) continue;
+            const double v = mi_nodal[i];
+            if (std::isfinite(v)) mi_eff_cart_min = std::min(mi_eff_cart_min, v);
+        }
+        if (!std::isfinite(mi_eff_cart_min)) return std::numeric_limits<double>::quiet_NaN();
+        std::cout << "  Interface min MI fallback (cartilage min): " << mi_eff_cart_min << "\n";
+        return mi_eff_cart_min;
+    }
+
+    std::cout << "  Interface min MI (bone-cartilage/cartilage-side): " << mi_eff_min
+              << " on " << n_if_nodes << " nodes\n";
+    return mi_eff_min;
+}
+
+// ============================================================
+// Ellipse helpers (Lowner / MVEE)
+// ============================================================
+struct Ellipse2D {
+    double c0 = 0.0, c1 = 0.0;
+    double a00 = 1.0, a01 = 0.0, a11 = 1.0;
+    bool valid = false;
+};
+
+static double eval_phi_ellipse(const R2 &P, const Ellipse2D &E) {
+    const double dx = P.x - E.c0;
+    const double dy = P.y - E.c1;
+    const double q = E.a00 * dx * dx + 2.0 * E.a01 * dx * dy + E.a11 * dy * dy;
+    return 1.0 - q;
+}
+
+static double ellipse_inhibition(const R2 &P) {
+    double spline_inhib = 1.0;
+    if (g_cfg.oss_spline_band > 1e-14) {
+        const double dist = std::abs(signed_distance_polygon(P, g_polygon));
+        const double t = std::clamp(dist / g_cfg.oss_spline_band, 0.0, 1.0);
+        spline_inhib = t * t * (3.0 - 2.0 * t);
+    }
+
+    double interface_inhib = 1.0;
+    if (g_cfg.ellipse_use_interface_inhibition && g_cfg.ellipse_interface_band > 1e-14) {
+        const double dy = P.y - g_cfg.interface_y;
+        const double t = std::clamp(dy / g_cfg.ellipse_interface_band, 0.0, 1.0);
+        interface_inhib = t * t * (3.0 - 2.0 * t);
+    }
+
+    return spline_inhib * interface_inhib;
+}
+
+static bool invert2x2(double m00, double m01, double m11,
+                      double &i00, double &i01, double &i11) {
+    const double det = m00 * m11 - m01 * m01;
+    if (std::abs(det) < 1e-20) return false;
+    const double inv_det = 1.0 / det;
+    i00 =  m11 * inv_det;
+    i01 = -m01 * inv_det;
+    i11 =  m00 * inv_det;
+    return true;
+}
+
+static bool invert3x3(const std::array<double, 9> &M, std::array<double, 9> &Inv) {
+    const double a = M[0], b = M[1], c = M[2];
+    const double d = M[3], e = M[4], f = M[5];
+    const double g = M[6], h = M[7], i = M[8];
+
+    const double A =  (e * i - f * h);
+    const double B = -(d * i - f * g);
+    const double C =  (d * h - e * g);
+    const double D = -(b * i - c * h);
+    const double E =  (a * i - c * g);
+    const double F = -(a * h - b * g);
+    const double G =  (b * f - c * e);
+    const double H = -(a * f - c * d);
+    const double I =  (a * e - b * d);
+
+    const double det = a * A + b * B + c * C;
+    if (std::abs(det) < 1e-24) return false;
+    const double inv_det = 1.0 / det;
+
+    Inv = {A * inv_det, D * inv_det, G * inv_det,
+           B * inv_det, E * inv_det, H * inv_det,
+           C * inv_det, F * inv_det, I * inv_det};
+    return true;
+}
+
+static double vector_quantile(std::vector<double> vals, double q) {
+    if (vals.empty()) return 0.0;
+    q = std::clamp(q, 0.0, 1.0);
+    const size_t idx = static_cast<size_t>(std::floor(q * (vals.size() - 1)));
+    std::nth_element(vals.begin(), vals.begin() + idx, vals.end());
+    return vals[idx];
+}
+
+struct EllipseAxes {
+    double major = 0.0;
+    double minor = 0.0;
+    double angle = 0.0;
+    double aspect = 1.0;
+};
+
+static EllipseAxes ellipse_axes_from_A(const Ellipse2D &E) {
+    EllipseAxes out;
+    const double tr = E.a00 + E.a11;
+    const double det = E.a00 * E.a11 - E.a01 * E.a01;
+    const double disc = std::sqrt(std::max(0.0, 0.25 * tr * tr - det));
+    const double lmax = std::max(1e-20, 0.5 * tr + disc);
+    const double lmin = std::max(1e-20, 0.5 * tr - disc);
+
+    out.major = 1.0 / std::sqrt(lmin);
+    out.minor = 1.0 / std::sqrt(lmax);
+    out.aspect = out.major / std::max(1e-20, out.minor);
+
+    double vx = E.a01;
+    double vy = lmin - E.a00;
+    if (std::abs(vx) + std::abs(vy) < 1e-20) {
+        vx = 1.0;
+        vy = 0.0;
+    }
+    out.angle = std::atan2(vy, vx);
+    return out;
+}
+
+static void clamp_ellipse_aspect(Ellipse2D &E, double max_aspect) {
+    max_aspect = std::max(1.0, max_aspect);
+
+    const double tr = E.a00 + E.a11;
+    const double det = E.a00 * E.a11 - E.a01 * E.a01;
+    const double disc = std::sqrt(std::max(0.0, 0.25 * tr * tr - det));
+    double lmax = std::max(1e-20, 0.5 * tr + disc);
+    double lmin = std::max(1e-20, 0.5 * tr - disc);
+    const double ratio = lmax / lmin;
+    const double ratio_max = max_aspect * max_aspect;
+    if (ratio <= ratio_max) return;
+
+    lmin = lmax / ratio_max;
+
+    double vx = E.a01;
+    double vy = lmax - E.a00;
+    if (std::abs(vx) + std::abs(vy) < 1e-20) {
+        vx = 1.0;
+        vy = 0.0;
+    }
+    const double vn = std::hypot(vx, vy);
+    vx /= vn;
+    vy /= vn;
+    const double wx = -vy;
+    const double wy = vx;
+
+    E.a00 = lmax * vx * vx + lmin * wx * wx;
+    E.a01 = lmax * vx * vy + lmin * wx * wy;
+    E.a11 = lmax * vy * vy + lmin * wy * wy;
+}
+
+static Ellipse2D fit_mvee(const std::vector<R2> &pts) {
+    Ellipse2D E;
+    const int d = 2;
+    const int m = static_cast<int>(pts.size());
+    if (m < std::max(3, g_cfg.ellipse_min_points)) return E;
+
+    std::vector<double> u(m, 1.0 / m);
+    const int max_iter = 250;
+    const double tol = 1e-6;
+
+    for (int it = 0; it < max_iter; ++it) {
+        std::array<double, 9> X = {0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0};
+        for (int k = 0; k < m; ++k) {
+            const double q0 = pts[k].x;
+            const double q1 = pts[k].y;
+            const double uk = u[k];
+            X[0] += uk * q0 * q0;
+            X[1] += uk * q0 * q1;
+            X[2] += uk * q0;
+            X[3] += uk * q1 * q0;
+            X[4] += uk * q1 * q1;
+            X[5] += uk * q1;
+            X[6] += uk * q0;
+            X[7] += uk * q1;
+            X[8] += uk;
+        }
+
+        std::array<double, 9> invX;
+        if (!invert3x3(X, invX)) return E;
+
+        int j = 0;
+        double mmax = -1.0;
+        for (int k = 0; k < m; ++k) {
+            const double q0 = pts[k].x;
+            const double q1 = pts[k].y;
+            const double t0 = invX[0] * q0 + invX[1] * q1 + invX[2];
+            const double t1 = invX[3] * q0 + invX[4] * q1 + invX[5];
+            const double t2 = invX[6] * q0 + invX[7] * q1 + invX[8];
+            const double Mk = q0 * t0 + q1 * t1 + t2;
+            if (Mk > mmax) {
+                mmax = Mk;
+                j = k;
+            }
+        }
+
+        if (mmax <= d + 1.0 + tol) break;
+        const double step = (mmax - (d + 1.0)) / ((d + 1.0) * (mmax - 1.0));
+        const double alpha = std::clamp(step, 0.0, 1.0);
+        for (int k = 0; k < m; ++k) u[k] *= (1.0 - alpha);
+        u[j] += alpha;
+    }
+
+    double cx = 0.0, cy = 0.0;
+    for (int k = 0; k < m; ++k) {
+        cx += u[k] * pts[k].x;
+        cy += u[k] * pts[k].y;
+    }
+
+    double s00 = 0.0, s01 = 0.0, s11 = 0.0;
+    for (int k = 0; k < m; ++k) {
+        const double dx = pts[k].x - cx;
+        const double dy = pts[k].y - cy;
+        s00 += u[k] * dx * dx;
+        s01 += u[k] * dx * dy;
+        s11 += u[k] * dy * dy;
+    }
+
+    s00 += 1e-12;
+    s11 += 1e-12;
+
+    double i00, i01, i11;
+    if (!invert2x2(s00, s01, s11, i00, i01, i11)) return E;
+
+    E.c0 = cx;
+    E.c1 = cy;
+    E.a00 = 0.5 * i00;
+    E.a01 = 0.5 * i01;
+    E.a11 = 0.5 * i11;
+
+    clamp_ellipse_aspect(E, g_cfg.ellipse_max_aspect);
+
+    const double gamma = std::max(1.0, g_cfg.ellipse_dilation);
+    const double inv_g2 = 1.0 / (gamma * gamma);
+    E.a00 *= inv_g2;
+    E.a01 *= inv_g2;
+    E.a11 *= inv_g2;
+
+    E.valid = std::isfinite(E.c0) && std::isfinite(E.c1)
+           && std::isfinite(E.a00) && std::isfinite(E.a01) && std::isfinite(E.a11)
+           && E.a00 > 0.0 && E.a11 > 0.0;
+    return E;
+}
+
 // ============================================================
 // Both-sides-trimmed VTK export
 // ============================================================
@@ -584,42 +900,10 @@ static void clip_polygon_both_sides(
     if (pos.size() >= 3) out.push_back(std::move(pos));
 }
 
-// One-sided clip: keeps only the phi < 0 side.
-// Used for the SOC outer boundary so that the outside piece of cut elements is discarded.
-static void clip_polygon_keep_negative(
-    const std::vector<R2> &poly,
-    const std::vector<double> &phi,
-    std::vector<std::vector<R2>> &out)
-{
-    int n = (int)poly.size();
-    if (n < 3) return;
-    bool all_pos = true;
-    for (double v : phi) { if (v < 0) { all_pos = false; break; } }
-    if (all_pos) return;  // entirely outside – discard
-    bool all_neg = true;
-    for (double v : phi) { if (v >= 0) { all_neg = false; break; } }
-    if (all_neg) { out.push_back(poly); return; }  // entirely inside – keep
-
-    std::vector<R2> neg;
-    for (int i = 0; i < n; ++i) {
-        int j = (i + 1) % n;
-        if (phi[i] < 0) neg.push_back(poly[i]);
-        if ((phi[i] < 0) != (phi[j] < 0)) {
-            double t = phi[i] / (phi[i] - phi[j]);
-            neg.push_back(R2(poly[i].x + t*(poly[j].x - poly[i].x),
-                             poly[i].y + t*(poly[j].y - poly[i].y)));
-        }
-    }
-    if ((int)neg.size() >= 3) out.push_back(std::move(neg));
-}
-
-// boundary_clips : one-sided (keep phi<0), used for the SOC outer boundary
-// split_levelsets: two-sided (keep both sides), used for bone/cartilage and ossification interfaces
 static void write_trimmed_both_vtk(
     const std::string &filename,
     const cutmesh_t &Khi,
-    const std::vector<PhiFn> &boundary_clips,
-    const std::vector<PhiFn> &split_levelsets,
+    const std::vector<PhiFn> &levelsets,
     const std::vector<ScalarField> &sca_fields,
     const std::vector<ScalarField> &cell_fields = {},
     const std::vector<CellFn> &cell_fns = {},
@@ -637,20 +921,7 @@ static void write_trimmed_both_vtk(
         std::vector<std::vector<R2>> polys;
         { std::vector<R2> q; for (int i = 0; i < 4; ++i) q.push_back(Khi[ka][i]); polys.push_back(std::move(q)); }
 
-        // One-sided clips first: trim to SOC interior, discard outside pieces
-        for (auto &phi : boundary_clips) {
-            std::vector<std::vector<R2>> next;
-            for (auto &poly : polys) {
-                std::vector<double> vals;
-                vals.reserve(poly.size());
-                for (auto &p : poly) vals.push_back(phi(p, kb));
-                clip_polygon_keep_negative(poly, vals, next);
-            }
-            polys = std::move(next);
-        }
-
-        // Two-sided splits: keep both sub-cells at each material interface
-        for (auto &phi : split_levelsets) {
+        for (auto &phi : levelsets) {
             std::vector<std::vector<R2>> next;
             for (auto &poly : polys) {
                 std::vector<double> vals;
@@ -751,7 +1022,7 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         config_path = argv[1];
     } else {
-        const std::string default_path = "configs/growth_iterative_convex.json";
+        const std::string default_path = "configs/growth_iterative_lowner_convex.json";
         if (std::filesystem::exists(default_path)) config_path = default_path;
     }
 
@@ -771,6 +1042,17 @@ int main(int argc, char **argv) {
     }
     if (g_cfg.n_iterations < 1 || g_cfg.mesh_nx < 2 || g_cfg.transfinite_nodes < 2) {
         std::cerr << "Invalid config: n_iterations >= 1, mesh_nx >= 2, transfinite_nodes >= 2 are required.\n";
+        return 1;
+    }
+    if (g_cfg.ellipse_mode != "outer_mvee") {
+        std::cerr << "Invalid config: ellipse_mode must be 'outer_mvee'.\n";
+        return 1;
+    }
+    if (g_cfg.ellipse_active_quantile < 0.0 || g_cfg.ellipse_active_quantile > 1.0 ||
+        g_cfg.ellipse_threshold_scale <= 0.0 || g_cfg.ellipse_dilation < 1.0 ||
+        g_cfg.ellipse_min_points < 3 || g_cfg.ellipse_max_aspect < 1.0 ||
+        g_cfg.ellipse_interface_band < 0.0) {
+        std::cerr << "Invalid ellipse config: quantile in [0,1], threshold_scale>0, dilation>=1, min_points>=3, max_aspect>=1, interface_band>=0.\n";
         return 1;
     }
     if (g_cfg.output_dir.empty()) {
@@ -804,6 +1086,18 @@ int main(int argc, char **argv) {
 
     space_t Sh(Kh, DataFE<mesh_t>::P1);
     int nb_sca = Sh.NbDoF();
+
+    std::vector<R2> node_points(nb_sca, R2(0.0, 0.0));
+    std::vector<char> node_seen(nb_sca, 0);
+    for (int k = 0; k < Kh.nt; ++k) {
+        const auto &FK = Sh[k];
+        for (int j = 0; j < FK.NbDoF(); ++j) {
+            const int iglo = Sh(k, j);
+            if (iglo < 0 || iglo >= nb_sca || node_seen[iglo]) continue;
+            node_points[iglo] = FK.Pt(j);
+            node_seen[iglo] = 1;
+        }
+    }
 
     std::cout << "Mesh: " << nx << "x" << ny << ", h=" << h
               << ", vec DOFs=" << nb_dof << ", sca DOFs=" << nb_sca
@@ -925,11 +1219,14 @@ int main(int argc, char **argv) {
                                 const fct_t &hd_fh, const fct_t &oct_fh,
                                 const fct_t &mi_fh, const fct_t &mat_fh,
                                 fct_t &phi_soc_fh,
-                                const std::vector<double> &phi_oss_data)
+                                const std::vector<double> &phi_oss_data,
+                                const std::vector<double> &phi_mi_iso_data)
     {
         std::string tag = std::to_string(iter);
         const std::string output_prefix = std::filesystem::path(g_cfg.output_dir).filename().string();
         const std::string iter_prefix = output_prefix + "_iter_" + tag;
+        std::span<double> phi_mi_iso_span(const_cast<double*>(phi_mi_iso_data.data()), phi_mi_iso_data.size());
+        fct_t phi_mi_iso_fh(Sh, phi_mi_iso_span);
 
         // Per-step outputs
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
@@ -941,6 +1238,7 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            w.add(phi_mi_iso_fh, "phi_mi_iso", 0, 1);
         }
 
         // Fields (trimmed at SOC boundary)
@@ -954,6 +1252,7 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            w.add(phi_mi_iso_fh, "phi_mi_iso", 0, 1);
         }
 
         // Active elements (full quads)
@@ -968,22 +1267,21 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            w.add(phi_mi_iso_fh, "phi_mi_iso", 0, 1);
         }
 
         // Trimmed both sides
         if (g_cfg.export_trimmed) {
-        // One-sided: trim outside the SOC outer boundary (discard outside pieces of cut elements)
-        std::vector<PhiFn> soc_boundary_clip = {
-            [](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }
-        };
-        // Two-sided: keep both sub-cells at each material interface
-        std::vector<PhiFn> interface_splits = {
+        std::vector<PhiFn> clip_levelsets = {
+            [](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
             [](const R2& P, int) { return P.y - g_cfg.interface_y; }
         };
-        interface_splits.push_back(
-            [&phi_soc_fh](const R2& P, int kb) {
-                return phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0);
-            });
+        if (iter > 0) {
+            clip_levelsets.push_back(
+                [&phi_soc_fh](const R2& P, int kb) {
+                    return phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0);
+                });
+        }
 
         std::vector<ScalarField> sca = {
             {const_cast<fct_t*>(&hd_fh), "hydrostatic"},
@@ -991,19 +1289,27 @@ int main(int argc, char **argv) {
             {const_cast<fct_t*>(&mi_fh), "miner_index"},
             {&phi_outer_fh, "phi_outer"},
             {&phi_iface_fh, "phi_interface"},
-            {&phi_soc_fh, "phi_soc"}
+            {&phi_soc_fh, "phi_soc"},
+            {&phi_mi_iso_fh, "phi_mi_iso"}
         };
 
-        // material_sharp: hard 0/1 assignment using current ossification front
-        CellFn mat_sharp = {[&phi_soc_fh](const R2& P, int kb) -> double {
-            if (P.y < g_cfg.interface_y) return 1.0;
-            if (phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0) return 1.0;
-            return 0.0;
-        }, "material_sharp"};
+        // Build material_sharp lambda based on iteration
+        CellFn mat_sharp;
+        if (iter == 0) {
+            mat_sharp = {[](const R2& P, int) -> double {
+                return P.y < g_cfg.interface_y ? 1.0 : 0.0;
+            }, "material_sharp"};
+        } else {
+            mat_sharp = {[&phi_soc_fh](const R2& P, int kb) -> double {
+                if (P.y < g_cfg.interface_y) return 1.0;
+                if (phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0) return 1.0;
+                return 0.0;
+            }, "material_sharp"};
+        }
 
         write_trimmed_both_vtk(
             g_cfg.output_dir + "/" + iter_prefix + "_trimmed.vtk", Khi,
-            soc_boundary_clip, interface_splits, sca,
+            clip_levelsets, sca,
             {{const_cast<fct_t*>(&mat_fh), "material"}},
             {mat_sharp},
             const_cast<fct_t*>(&uh_avg), "displacement");
@@ -1040,43 +1346,170 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            w.add(phi_mi_iso_fh, "phi_mi_iso", 0, 1);
         }
     };
 
     // ============================================================
     // Iterative loop
     // ============================================================
-    std::vector<double> prev_phi_oss_data(nb_sca, -1.0);
-    double fixed_threshold = 0.0; // computed once at iter 0, reused for all iterations
+    // Per-node state tracking from previous iterations
+    std::vector<double> prev_phi_oss_data(nb_sca, -1.0); // φ_soc from previous iteration (negative = no ossification)
+    std::vector<double> prev_mi_avg(nb_sca, 0.0);       // MI from previous iteration
+    double prev_threshold = 0.0;                         // threshold from previous iteration
+
     for (int iter = 0; iter < g_cfg.n_iterations; ++iter) {
         std::cout << "\n=== Iteration " << iter << " ===\n";
 
         // Build material coefficients for this iteration:
         //   bone region (y < interfaceY):  always bone
-        //   cartilage (y >= interface):    cartilage
+        //   ossified nodes (from prev):    bone
+        //   remaining cartilage:           cartilage
+        //
+        // For iter 0: just bone + cartilage
+        // For iter 1+: prev ossified region → bone
 
         std::vector<double> tmu_data(nb_sca), lam_data(nb_sca);
         std::vector<double> mat_data(nb_sca, 0.0);
 
-        // Current ossification level set data (from current iteration's MI)
+        // Current ossification level set data (from previous iteration's MI)
         std::vector<double> phi_oss_data(nb_sca, -1.0);
+        // MI isocontour level set used to select ellipse-active points.
+        std::vector<double> phi_mi_iso_data(nb_sca, -1.0);
 
-        // Base material, with carry-over ossification from previous iteration
-        for (int k = 0; k < Kh.nt; ++k) {
-            const auto &FK = Sh[k];
-            for (int j = 0; j < FK.NbDoF(); ++j) {
-                int iglo = Sh(k, j);
-                if (iglo < 0 || iglo >= nb_sca) continue;
-                R2 P = FK.Pt(j);
-                const bool ossified_prev = (iter > 0 && prev_phi_oss_data[iglo] >= 0.0);
-                if (P.y < g_cfg.interface_y || ossified_prev) {
-                    tmu_data[iglo] = 2.0 * mu_bone;
-                    lam_data[iglo] = lambda_bone;
-                    mat_data[iglo] = 1.0; // bone
-                } else {
-                    tmu_data[iglo] = 2.0 * mu_cart;
-                    lam_data[iglo] = lambda_cart;
-                    mat_data[iglo] = 0.0; // cartilage
+        if (iter == 0) {
+            // Pure bone + cartilage
+            for (int k = 0; k < Kh.nt; ++k) {
+                const auto &FK = Sh[k];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(k, j);
+                    if (iglo < 0 || iglo >= nb_sca) continue;
+                    R2 P = FK.Pt(j);
+                    if (P.y < g_cfg.interface_y) {
+                        tmu_data[iglo] = 2.0 * mu_bone;
+                        lam_data[iglo] = lambda_bone;
+                        mat_data[iglo] = 1.0; // bone
+                    } else {
+                        tmu_data[iglo] = 2.0 * mu_cart;
+                        lam_data[iglo] = lambda_cart;
+                        mat_data[iglo] = 0.0; // cartilage
+                    }
+                }
+            }
+        } else {
+            // Use MI from previous iteration to define ossification
+            // Start with base material
+            for (int k = 0; k < Kh.nt; ++k) {
+                const auto &FK = Sh[k];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(k, j);
+                    if (iglo < 0 || iglo >= nb_sca) continue;
+                    R2 P = FK.Pt(j);
+                    if (P.y < g_cfg.interface_y || prev_phi_oss_data[iglo] >= 0.0) {
+                        tmu_data[iglo] = 2.0 * mu_bone;
+                        lam_data[iglo] = lambda_bone;
+                        mat_data[iglo] = 1.0; // bone
+                    } else {
+                        tmu_data[iglo] = 2.0 * mu_cart;
+                        lam_data[iglo] = lambda_cart;
+                        mat_data[iglo] = 0.0; // cartilage
+                    }
+                }
+            }
+
+            // Build new ossification level set from previous iteration's MI,
+            // then replace the front by a Lowner/MVEE ellipse when fit succeeds.
+            std::vector<double> inhibition_data(nb_sca, 1.0);
+            std::vector<double> mi_eff(nb_sca, 0.0);
+            std::vector<double> candidate_vals;
+            candidate_vals.reserve(nb_sca);
+
+            for (int i = 0; i < nb_sca; ++i) {
+                const R2 P = node_points[i];
+                const bool in_soc = signed_distance_polygon(P, g_polygon) <= 0.0;
+                const bool is_candidate = (prev_phi_oss_data[i] < 0.0 && in_soc && P.y >= g_cfg.interface_y);
+
+                const double inhibition = g_cfg.ellipse_use_inhibition ? ellipse_inhibition(P) : 1.0;
+                inhibition_data[i] = inhibition;
+                mi_eff[i] = prev_mi_avg[i] * inhibition;
+
+                if (is_candidate && std::isfinite(mi_eff[i]))
+                    candidate_vals.push_back(mi_eff[i]);
+
+                phi_oss_data[i] = is_candidate ? (mi_eff[i] - prev_threshold) : -1.0;
+            }
+
+            const bool enable_ellipse_front = (iter >= 2);
+            bool used_ellipse = false;
+            Ellipse2D ellipse;
+            int active_pts = 0;
+            double active_cut = prev_threshold * g_cfg.ellipse_threshold_scale;
+
+            if (enable_ellipse_front && !candidate_vals.empty()) {
+                const double qcut = vector_quantile(candidate_vals, g_cfg.ellipse_active_quantile);
+                active_cut = std::max(active_cut, qcut);
+
+                std::vector<R2> active;
+                active.reserve(candidate_vals.size());
+                for (int i = 0; i < nb_sca; ++i) {
+                    const R2 P = node_points[i];
+                    if (prev_phi_oss_data[i] >= 0.0 || P.y < g_cfg.interface_y) continue;
+                    if (signed_distance_polygon(P, g_polygon) > 0.0) continue;
+                    if (mi_eff[i] >= active_cut) active.push_back(P);
+                }
+
+                active_pts = static_cast<int>(active.size());
+                if (active_pts >= g_cfg.ellipse_min_points) {
+                    ellipse = fit_mvee(active);
+                    if (ellipse.valid) {
+                        used_ellipse = true;
+                        for (int i = 0; i < nb_sca; ++i) {
+                            const R2 P = node_points[i];
+                            if (prev_phi_oss_data[i] >= 0.0 || P.y < g_cfg.interface_y ||
+                                signed_distance_polygon(P, g_polygon) > 0.0) {
+                                phi_oss_data[i] = -1.0;
+                            } else {
+                                phi_oss_data[i] = eval_phi_ellipse(P, ellipse);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < nb_sca; ++i) {
+                const R2 P = node_points[i];
+                const bool is_candidate = (prev_phi_oss_data[i] < 0.0 && P.y >= g_cfg.interface_y &&
+                                           signed_distance_polygon(P, g_polygon) <= 0.0);
+                phi_mi_iso_data[i] = is_candidate ? (mi_eff[i] - active_cut) : -1.0;
+            }
+
+            if (used_ellipse) {
+                const auto ax = ellipse_axes_from_A(ellipse);
+                std::cout << "  Ellipse front: active=" << active_pts
+                          << ", cut=" << active_cut
+                          << ", center=(" << ellipse.c0 << ", " << ellipse.c1 << ")"
+                          << ", axes=(" << ax.major << ", " << ax.minor << ")"
+                          << ", angle=" << ax.angle
+                          << ", aspect=" << ax.aspect << "\n";
+            } else if (!enable_ellipse_front) {
+                std::cout << "  First ossification update: using baseline MI-threshold front\n";
+            } else {
+                std::cout << "  Ellipse front fallback: using MI-threshold level set"
+                          << " (candidates=" << candidate_vals.size()
+                          << ", active_cut=" << active_cut << ")\n";
+            }
+
+            int n_ossified = 0;
+            for (int i = 0; i < nb_sca; ++i)
+                if (phi_oss_data[i] >= 0.0) ++n_ossified;
+            std::cout << "  Ossified nodes (next iter): " << n_ossified << " / " << nb_sca << "\n";
+
+            // Apply new ossification to material in the same iteration
+            for (int i = 0; i < nb_sca; ++i) {
+                if (phi_oss_data[i] >= 0.0) {
+                    tmu_data[i] = 2.0 * mu_bone;
+                    lam_data[i] = lambda_bone;
+                    mat_data[i] = 1.0; // bone
                 }
             }
         }
@@ -1099,64 +1532,38 @@ int main(int argc, char **argv) {
         fct_t oct_fh(Sh, oct_span);
         std::span<double> mi_span(result.sf_avg.miner);
         fct_t mi_fh(Sh, mi_span);
-
-        // mat_fh reflects the material used in this iteration's solve (current state)
         std::span<double> mat_span(mat_data);
         fct_t mat_fh(Sh, mat_span);
 
-        // phi_soc_fh for export: use prev_phi_oss_data (the ossification that was
-        // applied as material for this solve), not the newly computed one
-        std::span<double> prev_phi_oss_span(prev_phi_oss_data);
-        fct_t phi_soc_fh(Sh, prev_phi_oss_span);
+        // phi_soc FE function for this iteration
+        std::span<double> phi_oss_span(phi_oss_data);
+        fct_t phi_soc_fh(Sh, phi_oss_span);
 
-        // Export VTK (shows the state used in the current solve)
-        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
-                         phi_soc_fh, prev_phi_oss_data);
+        // Find thresholds for next iteration.
+        // Keep iteration-0 behavior identical to the original method (axis-based),
+        // then switch to interface-max updates from iteration 1 onward.
+        const double threshold_axis = find_threshold(result.sf_avg.miner, Sh, Kh);
+        double threshold_interface = threshold_axis;
+        if (iter >= 1)
+            threshold_interface = compute_interface_min_threshold(result.sf_avg.miner, mat_data, Sh, Kh);
+        if (!std::isfinite(threshold_interface))
+            threshold_interface = threshold_axis;
 
-        // Threshold is computed once at iter 0 and reused for all iterations
-        if (iter == 0)
-            fixed_threshold = find_threshold(result.sf_avg.miner, Sh, Kh);
-        const double threshold = fixed_threshold;
-
-        // Build current ossification level set from current MI.
-        // Keep previously ossified nodes ossified (irreversible front).
-        for (int k = 0; k < Kh.nt; ++k) {
-            const auto &FK = Sh[k];
-            for (int j = 0; j < FK.NbDoF(); ++j) {
-                int iglo = Sh(k, j);
-                if (iglo < 0 || iglo >= nb_sca) continue;
-                R2 P = FK.Pt(j);
-                if (P.y < g_cfg.interface_y) {
-                    phi_oss_data[iglo] = -1.0;
-                    continue;
-                }
-                if (iter > 0 && prev_phi_oss_data[iglo] >= 0.0) {
-                    phi_oss_data[iglo] = 1.0;
-                    continue;
-                }
-                if (signed_distance_polygon(P, g_polygon) > 0.0) {
-                    phi_oss_data[iglo] = -1.0;
-                    continue;
-                }
-                double dist_outer = std::abs(signed_distance_polygon(P, g_polygon));
-                double t_outer = std::clamp(dist_outer / g_cfg.oss_spline_band, 0.0, 1.0);
-                double inh_outer = t_outer * t_outer * (3.0 - 2.0 * t_outer);
-
-                double dist_iface = P.y - g_cfg.interface_y;
-                double t_iface = std::clamp(dist_iface / g_cfg.oss_spline_band, 0.0, 1.0);
-                double inh_iface = t_iface * t_iface * (3.0 - 2.0 * t_iface);
-
-                double inhibition = inh_outer * inh_iface;
-                phi_oss_data[iglo] = result.sf_avg.miner[iglo] * inhibition - threshold;
-            }
+        if (iter == 0) {
+            std::cout << "  Next threshold (iter0 baseline): axis_ref=" << threshold_axis << "\n";
+        } else {
+            std::cout << "  Next threshold: interface_min=" << threshold_interface
+                      << " (axis_ref=" << threshold_axis << ")\n";
         }
-        int n_ossified = 0;
-        for (int i = 0; i < nb_sca; ++i)
-            if (phi_oss_data[i] >= 0.0) ++n_ossified;
-        std::cout << "  Ossified nodes (current): " << n_ossified << " / " << nb_sca << "\n";
 
-        // Store ossification for next iteration material update
+        // Export VTK
+        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
+                         phi_soc_fh, phi_oss_data, phi_mi_iso_data);
+
+        // Store MI and threshold for next iteration
         prev_phi_oss_data = phi_oss_data;
+        prev_mi_avg = result.sf_avg.miner;
+        prev_threshold = (iter == 0) ? threshold_axis : threshold_interface;
 
         std::cout << "  Iteration " << iter << " done.\n";
     }

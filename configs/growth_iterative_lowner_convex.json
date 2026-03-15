@@ -1,5 +1,5 @@
 {
-  "n_iterations": 10,
+  "n_iterations": 30,
   "export_cartilage": false,
   "export_active": false,
   "export_trimmed": true,
@@ -11,12 +11,21 @@
   "oss_height_target": 0.1,
   "k_mi": 0.5,
   "oss_spline_band": 0.3,
+  "ellipse_mode": "outer_mvee",
+  "ellipse_active_quantile": 0.9,
+  "ellipse_threshold_scale": 1.0,
+  "ellipse_dilation": 1.05,
+  "ellipse_min_points": 8,
+  "ellipse_max_aspect": 6.0,
+  "ellipse_use_inhibition": true,
+  "ellipse_use_interface_inhibition": true,
+  "ellipse_interface_band": 0.15,
   "load_center_u_frac": 0.5,
   "load_du_frac": 0.08,
   "load_radius_scale": 1.0,
   "load_p_peak": 1.0,
   "mesh_nx": 200,
   "mesh_y_offset": -0.00113,
-  "output_dir": "output/growth_iterative",
-  "gmsh_model_name": "growth_iterative_cutfem"
+  "output_dir": "output/growth_iterative_lowner_convex",
+  "gmsh_model_name": "growth_iterative_lowner_convex"
 }
