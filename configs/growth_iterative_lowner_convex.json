@@ -1,5 +1,5 @@
 {
-  "n_iterations": 30,
+  "n_iterations": 20,
   "export_cartilage": false,
   "export_active": false,
   "export_trimmed": true,
@@ -8,7 +8,7 @@
   "bspline_weights": [1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0],
   "transfinite_nodes": 101,
   "interface_y": 1.0,
-  "oss_height_target": 0.1,
+  "oss_height_target": 0.05,
   "k_mi": 0.5,
   "oss_spline_band": 0.3,
   "ellipse_mode": "outer_mvee",
@@ -24,7 +24,7 @@
   "load_du_frac": 0.08,
   "load_radius_scale": 1.0,
   "load_p_peak": 1.0,
-  "mesh_nx": 200,
+  "mesh_nx": 400,
   "mesh_y_offset": -0.00113,
   "output_dir": "output/growth_iterative_lowner_convex",
   "gmsh_model_name": "growth_iterative_lowner_convex"

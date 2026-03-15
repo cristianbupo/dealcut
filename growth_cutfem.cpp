@@ -257,8 +257,36 @@ static Invariants compute_invariants(double exx, double eyy, double exy, double 
     double J2 = dxx*dxx + dyy*dyy + dzz*dzz + 2.0*sxy*sxy;
     double vm = std::sqrt(1.5 * J2);
     double oct = std::sqrt(2.0/3.0) * vm;
-    return {vm, hd, oct, oct + kMi*hd};
+    return {vm, hd, oct, oct + kMi*std::min(hd, 0.0)};
 }
+
+// ============================================================
+// Algoim level-set for per-element material interface
+// ============================================================
+// Bilinear interpolation of (interfaceY - P.y) on an axis-aligned quad.
+// phi < 0 ↔ cartilage (above interface), phi > 0 ↔ bone (below interface).
+struct ElementInterfaceLS {
+    double xmin, xmax, ymin, ymax;
+    double v00, v10, v01, v11;
+    double t = 0.0; // unused, required by Algoim interface
+
+    template <typename V>
+    typename V::value_type operator()(const V &P) const {
+        auto s = (P[0] - xmin) / (xmax - xmin);
+        auto t_ = (P[1] - ymin) / (ymax - ymin);
+        return (1 - s) * (1 - t_) * v00 + s * (1 - t_) * v10
+             + (1 - s) * t_ * v01       + s * t_ * v11;
+    }
+
+    template <typename T>
+    algoim::uvector<T, 2> grad(const algoim::uvector<T, 2> &x) const {
+        T s  = (x(0) - xmin) / (xmax - xmin);
+        T t_ = (x(1) - ymin) / (ymax - ymin);
+        T dfdx = ((1 - t_) * (v10 - v00) + t_ * (v11 - v01)) / (xmax - xmin);
+        T dfdy = ((1 - s)  * (v01 - v00) + s  * (v11 - v10)) / (ymax - ymin);
+        return algoim::uvector<T, 2>(dfdx, dfdy);
+    }
+};
 
 // ============================================================
 // Stress fields: hydrostatic, octahedral shear, Miner index
@@ -267,14 +295,18 @@ struct StressFields {
     std::vector<double> hydrostatic, oct_shear, miner;
 };
 
-// Compute stress fields at nodes by averaging element-centroid values.
-// For Q1, strain is constant per element; averaging to nodes preserves symmetry.
+// Compute stress fields at nodes using Algoim quadrature on cut elements.
+// Uncut cartilage: centroid evaluation. Cut elements (straddling bone-cartilage
+// interface): Algoim quadrature on the cartilage sub-domain with pure cartilage
+// material. Fully bone elements: skipped.
 static StressFields compute_stress_fields(
     const fct_t &uh, const space_t &Sh,
     const cutmesh_t &Khi, const mesh_t &Kh, int nb_sca_dof)
 {
+    static constexpr int algoim_order = 3;
+
     std::vector<double> hd_sum(nb_sca_dof, 0.0), oct_sum(nb_sca_dof, 0.0), mi_sum(nb_sca_dof, 0.0);
-    std::vector<int>    cnt(nb_sca_dof, 0);
+    std::vector<double> wt_sum(nb_sca_dof, 0.0);
 
     int nact = Khi.get_nb_element();
     for (int ka = 0; ka < nact; ++ka) {
@@ -282,36 +314,102 @@ static StressFields compute_stress_fields(
         const auto &FK = Sh[kb];
         int ndf = FK.NbDoF();
 
-        R2 centroid(0.0, 0.0);
+        // Gather node positions and classify material side
+        R2 pts[4];
+        bool has_bone = false, has_cart = false;
         for (int j = 0; j < ndf; ++j) {
-            R2 Pj = FK.Pt(j);
-            centroid.x += Pj.x;
-            centroid.y += Pj.y;
+            pts[j] = FK.Pt(j);
+            if (pts[j].y < interfaceY) has_bone = true;
+            else                        has_cart = true;
         }
-        centroid.x /= ndf;
-        centroid.y /= ndf;
 
-        double du0_dx = uh.eval(ka, (const double*)&centroid, 0, 1);
-        double du0_dy = uh.eval(ka, (const double*)&centroid, 0, 2);
-        double du1_dx = uh.eval(ka, (const double*)&centroid, 1, 1);
-        double du1_dy = uh.eval(ka, (const double*)&centroid, 1, 2);
+        if (!has_cart) continue; // fully bone → skip
 
-        double exx = du0_dx, eyy = du1_dy;
-        double exy = 0.5 * (du0_dy + du1_dx);
+        if (!has_bone) {
+            // ---- Fully cartilage: centroid evaluation ----
+            R2 centroid(0.0, 0.0);
+            for (int j = 0; j < ndf; ++j) {
+                centroid.x += pts[j].x;
+                centroid.y += pts[j].y;
+            }
+            centroid.x /= ndf;
+            centroid.y /= ndf;
 
-        double lam, mu;
-        if (centroid.y < interfaceY) { lam = lambda_bone; mu = mu_bone; }
-        else { lam = lambda_cart; mu = mu_cart; }
+            double du0_dx = uh.eval(ka, (const double*)&centroid, 0, 1);
+            double du0_dy = uh.eval(ka, (const double*)&centroid, 0, 2);
+            double du1_dx = uh.eval(ka, (const double*)&centroid, 1, 1);
+            double du1_dy = uh.eval(ka, (const double*)&centroid, 1, 2);
 
-        auto inv = compute_invariants(exx, eyy, exy, lam, mu);
+            double exx = du0_dx, eyy = du1_dy;
+            double exy = 0.5 * (du0_dy + du1_dx);
 
-        for (int j = 0; j < ndf; ++j) {
-            int iglo = Sh(kb, j);
-            if (iglo < 0 || iglo >= nb_sca_dof) continue;
-            hd_sum[iglo]  += inv.hydrostatic;
-            oct_sum[iglo] += inv.oct_shear;
-            mi_sum[iglo]  += inv.miner;
-            cnt[iglo]     += 1;
+            auto inv = compute_invariants(exx, eyy, exy, lambda_cart, mu_cart);
+
+            double elem_area = (pts[1].x - pts[0].x) * (pts[3].y - pts[0].y);
+            for (int j = 0; j < ndf; ++j) {
+                int iglo = Sh(kb, j);
+                if (iglo < 0 || iglo >= nb_sca_dof) continue;
+                hd_sum[iglo]  += inv.hydrostatic * elem_area;
+                oct_sum[iglo] += inv.oct_shear   * elem_area;
+                mi_sum[iglo]  += inv.miner       * elem_area;
+                wt_sum[iglo]  += elem_area;
+            }
+        } else {
+            // ---- Cut element: Algoim quadrature on cartilage sub-domain ----
+            double xmin = pts[0].x, ymin = pts[0].y;
+            double xmax = pts[2].x, ymax = pts[2].y;
+
+            // phi = interfaceY - P.y : negative above interface (cartilage)
+            ElementInterfaceLS phi_iface;
+            phi_iface.xmin = xmin; phi_iface.xmax = xmax;
+            phi_iface.ymin = ymin; phi_iface.ymax = ymax;
+            phi_iface.v00 = interfaceY - pts[0].y;
+            phi_iface.v10 = interfaceY - pts[1].y;
+            phi_iface.v11 = interfaceY - pts[2].y;
+            phi_iface.v01 = interfaceY - pts[3].y;
+
+            algoim::QuadratureRule<2> q = algoim::quadGen<2>(
+                phi_iface,
+                algoim::HyperRectangle<double, 2>(
+                    algoim::uvector<double, 2>{xmin, ymin},
+                    algoim::uvector<double, 2>{xmax, ymax}),
+                -1, -1, algoim_order);
+
+            if (q.nodes.empty()) continue;
+
+            // Accumulate area-weighted stress over cartilage quadrature points
+            double hd_acc = 0, oct_acc = 0, mi_acc = 0, w_acc = 0;
+            for (size_t iq = 0; iq < q.nodes.size(); ++iq) {
+                R2 mip(q.nodes[iq].x(0), q.nodes[iq].x(1));
+                double w = q.nodes[iq].w;
+
+                double du0_dx = uh.eval(ka, (const double*)&mip, 0, 1);
+                double du0_dy = uh.eval(ka, (const double*)&mip, 0, 2);
+                double du1_dx = uh.eval(ka, (const double*)&mip, 1, 1);
+                double du1_dy = uh.eval(ka, (const double*)&mip, 1, 2);
+
+                double exx = du0_dx, eyy = du1_dy;
+                double exy = 0.5 * (du0_dy + du1_dx);
+
+                auto inv = compute_invariants(exx, eyy, exy, lambda_cart, mu_cart);
+                hd_acc  += inv.hydrostatic * w;
+                oct_acc += inv.oct_shear   * w;
+                mi_acc  += inv.miner       * w;
+                w_acc   += w;
+            }
+
+            if (w_acc <= 0) continue;
+
+            // Distribute to cartilage-side nodes only
+            for (int j = 0; j < ndf; ++j) {
+                if (pts[j].y < interfaceY) continue; // bone node
+                int iglo = Sh(kb, j);
+                if (iglo < 0 || iglo >= nb_sca_dof) continue;
+                hd_sum[iglo]  += hd_acc;
+                oct_sum[iglo] += oct_acc;
+                mi_sum[iglo]  += mi_acc;
+                wt_sum[iglo]  += w_acc;
+            }
         }
     }
 
@@ -320,8 +418,8 @@ static StressFields compute_stress_fields(
     sf.oct_shear.resize(nb_sca_dof, 0.0);
     sf.miner.resize(nb_sca_dof, 0.0);
     for (int i = 0; i < nb_sca_dof; ++i) {
-        if (cnt[i] > 0) {
-            double inv = 1.0 / cnt[i];
+        if (wt_sum[i] > 0) {
+            double inv = 1.0 / wt_sum[i];
             sf.hydrostatic[i] = hd_sum[i] * inv;
             sf.oct_shear[i]   = oct_sum[i] * inv;
             sf.miner[i]       = mi_sum[i] * inv;
