@@ -10,7 +10,7 @@
   "interface_y": 1.0,
   "oss_height_target": 0.05,
   "k_mi_nucleation": 0.5,
-  "k_mi_growth": 0.0,
+  "k_mi_growth": 0.5,
   "hyd_ignore_positive": true,
   "oss_spline_band": 0.3,
   "ellipse_mode": "outer_mvee",
@@ -28,6 +28,6 @@
   "load_p_peak": 1.0,
   "mesh_nx": 400,
   "mesh_y_offset": -0.00113,
-  "output_dir": "output/cvx",
-  "gmsh_model_name": "cvx"
+  "output_dir": "output/cvx_hydg",
+  "gmsh_model_name": "cvx_hydg"
 }

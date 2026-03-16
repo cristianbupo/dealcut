@@ -9,7 +9,9 @@
   "transfinite_nodes": 101,
   "interface_y": 0.75,
   "oss_height_target": 0.05,
-  "k_mi": 1.0,
+  "k_mi_nucleation": 1.0,
+  "k_mi_growth": 0.0,
+  "hyd_ignore_positive": true,
   "oss_spline_band": 0.3,
   "ellipse_mode": "outer_mvee",
   "ellipse_active_quantile": 0.9,
@@ -26,6 +28,6 @@
   "load_p_peak": 1.0,
   "mesh_nx": 400,
   "mesh_y_offset": -0.00113,
-  "output_dir": "output/growth_iterative_lowner_concave",
-  "gmsh_model_name": "growth_iterative_lowner_concave"
+  "output_dir": "output/ccv",
+  "gmsh_model_name": "ccv"
 }

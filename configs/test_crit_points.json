@@ -1,7 +1,5 @@
 {
-  "n_iterations": 20,
-  "export_cartilage": false,
-  "export_active": false,
+  "n_iterations": 3,
   "export_trimmed": true,
   "p1_geom": 0.9,
   "p2_geom": 0.2,
@@ -28,6 +26,6 @@
   "load_p_peak": 1.0,
   "mesh_nx": 400,
   "mesh_y_offset": -0.00113,
-  "output_dir": "output/cvx",
-  "gmsh_model_name": "cvx"
+  "output_dir": "output/test_crit",
+  "gmsh_model_name": "test_crit"
 }

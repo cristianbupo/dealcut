@@ -1532,7 +1532,7 @@ int main(int argc, char **argv) {
                                 fct_t &phi_soc_fh,
                                 const std::vector<double> &phi_oss_data,
                                 const fct_t &peaks_fh,
-                                const fct_t &crit_fh,
+                                const std::vector<double> &crit_data,
                                 const fct_t &oct_gx_fh,
                                 const fct_t &oct_gy_fh,
                                 const fct_t &oct_gmag_fh)
@@ -1562,7 +1562,6 @@ int main(int argc, char **argv) {
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);
             w.add(const_cast<fct_t&>(mat_fh), "material", 0, 1);
             w.add(const_cast<fct_t&>(peaks_fh), "mi_peaks", 0, 1);
-            w.add(const_cast<fct_t&>(crit_fh), "oct_critical", 0, 1);
             w.add(const_cast<fct_t&>(oct_gx_fh), "oct_grad_x", 0, 1);
             w.add(const_cast<fct_t&>(oct_gy_fh), "oct_grad_y", 0, 1);
             w.add(const_cast<fct_t&>(oct_gmag_fh), "oct_grad_mag", 0, 1);
@@ -1580,13 +1579,55 @@ int main(int argc, char **argv) {
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);
             w.add(const_cast<fct_t&>(mat_fh), "material", 0, 1);
-            w.add(const_cast<fct_t&>(crit_fh), "oct_critical", 0, 1);
             w.add(const_cast<fct_t&>(oct_gx_fh), "oct_grad_x", 0, 1);
             w.add(const_cast<fct_t&>(oct_gy_fh), "oct_grad_y", 0, 1);
             w.add(const_cast<fct_t&>(oct_gmag_fh), "oct_grad_mag", 0, 1);
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+        }
+
+        // Critical points as VTK point cloud
+        {
+            // Build dof positions
+            std::vector<R2> dof_pos(nb_sca);
+            for (int k = 0; k < Kh.nt; ++k) {
+                const auto &FK = Sh[k];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(k, j);
+                    if (iglo >= 0 && iglo < nb_sca)
+                        dof_pos[iglo] = FK.Pt(j);
+                }
+            }
+
+            // Collect non-zero critical points
+            std::vector<R2> pts;
+            std::vector<double> types;
+            for (int i = 0; i < nb_sca; ++i) {
+                if (std::abs(crit_data[i]) < 0.01) continue;
+                pts.push_back(dof_pos[i]);
+                types.push_back(crit_data[i]);
+            }
+
+            std::string fname = g_cfg.output_dir + "/" + iter_prefix + "_crit_points.vtk";
+            std::ofstream ofs(fname);
+            ofs << "# vtk DataFile Version 3.0\n";
+            ofs << "Critical points of oct shear\n";
+            ofs << "ASCII\n";
+            ofs << "DATASET POLYDATA\n";
+            ofs << "POINTS " << pts.size() << " double\n";
+            for (auto &P : pts)
+                ofs << P.x << " " << P.y << " 0.0\n";
+            ofs << "VERTICES " << pts.size() << " " << 2 * pts.size() << "\n";
+            for (int i = 0; i < (int)pts.size(); ++i)
+                ofs << "1 " << i << "\n";
+            ofs << "POINT_DATA " << pts.size() << "\n";
+            ofs << "SCALARS crit_type double 1\n";
+            ofs << "LOOKUP_TABLE default\n";
+            for (double v : types)
+                ofs << v << "\n";
+            ofs.close();
+            std::cout << "  Exported " << pts.size() << " critical points to " << fname << "\n";
         }
 
         // Trimmed both sides
@@ -1609,7 +1650,6 @@ int main(int argc, char **argv) {
             {const_cast<fct_t*>(&oct_fh), "oct_shear"},
             {const_cast<fct_t*>(&mi_fh), "miner_index"},
             {const_cast<fct_t*>(&peaks_fh), "mi_peaks"},
-            {const_cast<fct_t*>(&crit_fh), "oct_critical"},
             {const_cast<fct_t*>(&oct_gx_fh), "oct_grad_x"},
             {const_cast<fct_t*>(&oct_gy_fh), "oct_grad_y"},
             {const_cast<fct_t*>(&oct_gmag_fh), "oct_grad_mag"},
@@ -1969,14 +2009,12 @@ int main(int argc, char **argv) {
         // Build FE functions for diagnostic fields
         std::span<double> peaks_span(peaks_data);
         fct_t peaks_fh(Sh, peaks_span);
-        std::span<double> crit_span(crit_data);
-        fct_t crit_fh(Sh, crit_span);
         std::span<double> gx_span(oct_grad.gx), gy_span(oct_grad.gy), gmag_span(oct_grad.mag);
         fct_t oct_gx_fh(Sh, gx_span), oct_gy_fh(Sh, gy_span), oct_gmag_fh(Sh, gmag_span);
 
         // Export VTK
         export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
-                         phi_soc_fh, prev_phi_oss_data, peaks_fh, crit_fh,
+                         phi_soc_fh, prev_phi_oss_data, peaks_fh, crit_data,
                          oct_gx_fh, oct_gy_fh, oct_gmag_fh);
 
         // Store ossification for next iteration material update
