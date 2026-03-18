@@ -57,18 +57,20 @@ struct SimConfig {
     double interface_y = 1.0;
     double oss_height_target = 0.1;
     double k_mi = 0.5;
+    double k_mi_nucleation = 0.5;
+    double k_mi_growth = 0.5;
     double oss_spline_band = 0.3;
 
-    // Ellipse (Löwner/MVEE) parameters
+    // Ellipse fitting parameters
     std::string ellipse_mode = "outer_mvee";
-    double ellipse_active_quantile = 0.9;
-    double ellipse_threshold_scale = 1.0;
     double ellipse_dilation = 1.05;
-    int ellipse_min_points = 8;
     double ellipse_max_aspect = 6.0;
-    bool ellipse_use_inhibition = true;
-    bool ellipse_use_interface_inhibition = true;
-    double ellipse_interface_band = 0.15;
+
+    // Which critical point types feed into ellipse fitting
+    bool crit_use_max = true;
+    bool crit_use_min = true;
+    bool crit_use_saddle = true;
+    double crit_lap_gap_factor = 0.0;  // drop weak |Laplacian| group if bimodal gap > this factor
 
     double load_center_u_frac = 0.50;
     double load_du_frac = 0.08;
@@ -76,7 +78,7 @@ struct SimConfig {
     double load_p_peak = 1.0;
 
     int mesh_nx = 200;
-    double mesh_y_offset = -0.00113;
+    double mesh_y_offset = 0.0;
 
     std::string output_dir = "output/growth_iterative";
     std::string gmsh_model_name = "growth_iterative_cutfem";
@@ -165,18 +167,18 @@ static bool load_config_from_json(const std::string &path, SimConfig &cfg) {
 
     parse_json_number(text, "interface_y", cfg.interface_y);
     parse_json_number(text, "oss_height_target", cfg.oss_height_target);
-    parse_json_number(text, "k_mi", cfg.k_mi);
+    parse_json_number(text, "k_mi_nucleation", cfg.k_mi_nucleation);
+    parse_json_number(text, "k_mi_growth", cfg.k_mi_growth);
     parse_json_number(text, "oss_spline_band", cfg.oss_spline_band);
 
     parse_json_string(text, "ellipse_mode", cfg.ellipse_mode);
-    parse_json_number(text, "ellipse_active_quantile", cfg.ellipse_active_quantile);
-    parse_json_number(text, "ellipse_threshold_scale", cfg.ellipse_threshold_scale);
     parse_json_number(text, "ellipse_dilation", cfg.ellipse_dilation);
-    parse_json_int(text, "ellipse_min_points", cfg.ellipse_min_points);
     parse_json_number(text, "ellipse_max_aspect", cfg.ellipse_max_aspect);
-    parse_json_bool(text, "ellipse_use_inhibition", cfg.ellipse_use_inhibition);
-    parse_json_bool(text, "ellipse_use_interface_inhibition", cfg.ellipse_use_interface_inhibition);
-    parse_json_number(text, "ellipse_interface_band", cfg.ellipse_interface_band);
+
+    parse_json_bool(text, "crit_use_max", cfg.crit_use_max);
+    parse_json_bool(text, "crit_use_min", cfg.crit_use_min);
+    parse_json_bool(text, "crit_use_saddle", cfg.crit_use_saddle);
+    parse_json_number(text, "crit_lap_gap_factor", cfg.crit_lap_gap_factor);
 
     parse_json_number(text, "load_center_u_frac", cfg.load_center_u_frac);
     parse_json_number(text, "load_du_frac", cfg.load_du_frac);
@@ -258,7 +260,12 @@ static double signed_distance_polygon(const R2 &p, const std::vector<R2> &poly) 
     return point_in_polygon(p, poly) ? -d : +d;
 }
 
-double fun_levelSet(R2 P, const int i) { return signed_distance_polygon(P, g_polygon); }
+double fun_levelSet(R2 P, const int i) {
+    double d = signed_distance_polygon(P, g_polygon);
+    // Nudge nodes sitting exactly on the boundary to avoid degenerate CutFEM cuts
+    if (std::abs(d) < 1e-10) d = 1e-10;
+    return d;
+}
 
 static R2 unit_normal_from_spline(const std::vector<R2> &top, unsigned int seg) {
     if (top.size() < 2 || seg+1 >= top.size()) return R2(0,0);
@@ -409,7 +416,7 @@ static Invariants compute_invariants(double exx, double eyy, double exy, double 
     double J2 = dxx*dxx + dyy*dyy + dzz*dzz + 2.0*sxy*sxy;
     double vm = std::sqrt(1.5 * J2);
     double oct = std::sqrt(2.0/3.0) * vm;
-    return {vm, hd, oct, oct + g_cfg.k_mi * std::min(hd, 0.0)};
+    return {vm, hd, oct, oct + g_cfg.k_mi * hd};
 }
 
 // ============================================================
@@ -588,26 +595,6 @@ static StressFields compute_stress_fields(
 // ============================================================
 // Threshold finding
 // ============================================================
-static double compute_cartilage_area(const space_t &Sh, const mesh_t &Kh) {
-    double area = 0.0;
-    for (int k = 0; k < Kh.nt; ++k) {
-        const auto &FK = Sh[k];
-        double y_avg = 0.0;
-        int ndf = FK.NbDoF();
-        for (int j = 0; j < ndf; ++j) y_avg += FK.Pt(j).y;
-        y_avg /= ndf;
-        if (y_avg < g_cfg.interface_y) continue;
-        R2 P0 = FK.Pt(0), P1 = FK.Pt(1), P2 = FK.Pt(2);
-        if (ndf >= 4) {
-            R2 P3 = FK.Pt(3);
-            area += 0.5 * std::abs((P2.x-P0.x)*(P3.y-P1.y) - (P3.x-P1.x)*(P2.y-P0.y));
-        } else {
-            area += 0.5 * std::abs((P1.x-P0.x)*(P2.y-P0.y) - (P2.x-P0.x)*(P1.y-P0.y));
-        }
-    }
-    return area;
-}
-
 static std::vector<std::pair<double,double>> build_axis_profile(
     const std::vector<double> &mi_nodal,
     const space_t &Sh, const mesh_t &Kh)
@@ -798,7 +785,7 @@ static Ellipse2D fit_mvee(const std::vector<R2> &pts) {
     Ellipse2D E;
     const int d = 2;
     const int m = static_cast<int>(pts.size());
-    if (m < std::max(3, g_cfg.ellipse_min_points)) return E;
+    if (m < 3) return E; // need at least 3 points for 2D MVEE
 
     std::vector<double> u(m, 1.0 / m);
     for (int it = 0; it < 250; ++it) {
@@ -839,8 +826,8 @@ static Ellipse2D fit_mvee(const std::vector<R2> &pts) {
     double i00, i01, i11;
     if (!invert2x2(s00, s01, s11, i00, i01, i11)) return E;
 
-    E.c0 = cx; E.c1 = cy;
-    E.a00 = 0.5*i00; E.a01 = 0.5*i01; E.a11 = 0.5*i11;
+    E.c0 = 0.0; E.c1 = cy;
+    E.a00 = 0.5*i00; E.a01 = 0.0; E.a11 = 0.5*i11;
     clamp_ellipse_aspect(E, g_cfg.ellipse_max_aspect);
 
     const double inv_g2 = 1.0 / (std::max(1.0, g_cfg.ellipse_dilation) * std::max(1.0, g_cfg.ellipse_dilation));
@@ -850,6 +837,56 @@ static Ellipse2D fit_mvee(const std::vector<R2> &pts) {
            && std::isfinite(E.a00) && std::isfinite(E.a01) && std::isfinite(E.a11)
            && E.a00 > 0.0 && E.a11 > 0.0;
     return E;
+}
+
+static Ellipse2D fit_regression(const std::vector<R2> &pts,
+                                const std::vector<double> &weights) {
+    // MI-weighted covariance ellipse: high-MI critical points pull the
+    // ellipse center and shape towards them.
+    Ellipse2D E;
+    const int m = static_cast<int>(pts.size());
+    if (m < 3) return E;
+
+    // Normalize weights to sum to 1
+    double wsum = 0.0;
+    for (int k = 0; k < m; ++k) wsum += weights[k];
+    if (wsum < 1e-30) return E;
+
+    double cx = 0.0, cy = 0.0;
+    for (int k = 0; k < m; ++k) {
+        const double w = weights[k] / wsum;
+        cx += w * pts[k].x; cy += w * pts[k].y;
+    }
+
+    double s00 = 0.0, s01 = 0.0, s11 = 0.0;
+    for (int k = 0; k < m; ++k) {
+        const double w = weights[k] / wsum;
+        const double dx = pts[k].x - cx, dy = pts[k].y - cy;
+        s00 += w * dx * dx; s01 += w * dx * dy; s11 += w * dy * dy;
+    }
+    s00 += 1e-12; s11 += 1e-12;
+
+    double i00, i01, i11;
+    if (!invert2x2(s00, s01, s11, i00, i01, i11)) return E;
+
+    E.c0 = 0.0; E.c1 = cy;
+    E.a00 = 0.5 * i00; E.a01 = 0.0; E.a11 = 0.5 * i11;
+    clamp_ellipse_aspect(E, g_cfg.ellipse_max_aspect);
+
+    const double inv_g2 = 1.0 / (std::max(1.0, g_cfg.ellipse_dilation) * std::max(1.0, g_cfg.ellipse_dilation));
+    E.a00 *= inv_g2; E.a01 *= inv_g2; E.a11 *= inv_g2;
+
+    E.valid = std::isfinite(E.c0) && std::isfinite(E.c1)
+           && std::isfinite(E.a00) && std::isfinite(E.a01) && std::isfinite(E.a11)
+           && E.a00 > 0.0 && E.a11 > 0.0;
+    return E;
+}
+
+static Ellipse2D fit_ellipse(const std::vector<R2> &pts,
+                             const std::vector<double> &weights) {
+    if (g_cfg.ellipse_mode == "regression")
+        return fit_regression(pts, weights);
+    return fit_mvee(pts);
 }
 
 // ============================================================
@@ -1132,7 +1169,11 @@ int main(int argc, char **argv) {
             if (iglo < 0 || iglo >= nb_sca) continue;
             R2 P = FK.Pt(j);
             phi_outer_data[iglo] = signed_distance_polygon(P, g_polygon);
-            phi_iface_data[iglo] = P.y - g_cfg.interface_y;
+            double phi_y = P.y - g_cfg.interface_y;
+            // If a node sits exactly on the interface, nudge it below
+            // to avoid degenerate CutFEM cuts
+            if (std::abs(phi_y) < 1e-10) phi_y = -1e-10;
+            phi_iface_data[iglo] = phi_y;
         }
     }
     std::span<double> phi_outer_span(phi_outer_data);
@@ -1434,6 +1475,54 @@ int main(int argc, char **argv) {
     };
 
     // ============================================================
+    // Discrete Laplacian of a scalar field (prominence of critical points)
+    // At a sharp max: large negative; at a sharp min: large positive;
+    // flat/insignificant extrema: near zero
+    // ============================================================
+    auto compute_laplacian = [&](const std::vector<double> &field) -> std::vector<double>
+    {
+        std::vector<std::vector<int>> adj(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            int ndf = FK.NbDoF();
+            for (int i = 0; i < ndf; ++i) {
+                int gi = Sh(k, i);
+                if (gi < 0 || gi >= nb_sca) continue;
+                for (int j = 0; j < ndf; ++j) {
+                    if (i == j) continue;
+                    int gj = Sh(k, j);
+                    if (gj < 0 || gj >= nb_sca) continue;
+                    adj[gi].push_back(gj);
+                }
+            }
+        }
+        for (auto &v : adj) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+
+        std::vector<R2> dof_pos(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            for (int j = 0; j < FK.NbDoF(); ++j) {
+                int iglo = Sh(k, j);
+                if (iglo >= 0 && iglo < nb_sca)
+                    dof_pos[iglo] = FK.Pt(j);
+            }
+        }
+
+        std::vector<double> lap(nb_sca, 0.0);
+        for (int i = 0; i < nb_sca; ++i) {
+            if (adj[i].empty()) continue;
+            double sum = 0.0;
+            for (int nb : adj[i])
+                sum += field[nb] - field[i];
+            lap[i] = sum / (double)adj[i].size();
+        }
+        return lap;
+    };
+
+    // ============================================================
     // Compute gradient of a scalar field using centered finite differences
     // Returns {grad_x, grad_y, grad_magnitude}
     // ============================================================
@@ -1533,9 +1622,12 @@ int main(int argc, char **argv) {
                                 const std::vector<double> &phi_oss_data,
                                 const fct_t &peaks_fh,
                                 const std::vector<double> &crit_data,
-                                const fct_t &oct_gx_fh,
-                                const fct_t &oct_gy_fh,
-                                const fct_t &oct_gmag_fh)
+                                const std::vector<double> &crit_used,
+                                const std::vector<double> &mi_laplacian,
+                                const fct_t &mi_lap_fh,
+                                const fct_t &mi_gx_fh,
+                                const fct_t &mi_gy_fh,
+                                const fct_t &mi_gmag_fh)
     {
         std::string tag = std::to_string(iter);
         const std::string output_prefix = std::filesystem::path(g_cfg.output_dir).filename().string();
@@ -1562,9 +1654,10 @@ int main(int argc, char **argv) {
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);
             w.add(const_cast<fct_t&>(mat_fh), "material", 0, 1);
             w.add(const_cast<fct_t&>(peaks_fh), "mi_peaks", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gx_fh), "oct_grad_x", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gy_fh), "oct_grad_y", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gmag_fh), "oct_grad_mag", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gx_fh), "mi_grad_x", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gy_fh), "mi_grad_y", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gmag_fh), "mi_grad_mag", 0, 1);
+            w.add(const_cast<fct_t&>(mi_lap_fh), "mi_laplacian", 0, 1);
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
@@ -1579,9 +1672,10 @@ int main(int argc, char **argv) {
             w.add(const_cast<fct_t&>(oct_fh), "oct_shear", 0, 1);
             w.add(const_cast<fct_t&>(mi_fh), "miner_index", 0, 1);
             w.add(const_cast<fct_t&>(mat_fh), "material", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gx_fh), "oct_grad_x", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gy_fh), "oct_grad_y", 0, 1);
-            w.add(const_cast<fct_t&>(oct_gmag_fh), "oct_grad_mag", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gx_fh), "mi_grad_x", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gy_fh), "mi_grad_y", 0, 1);
+            w.add(const_cast<fct_t&>(mi_gmag_fh), "mi_grad_mag", 0, 1);
+            w.add(const_cast<fct_t&>(mi_lap_fh), "mi_laplacian", 0, 1);
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
@@ -1603,16 +1697,20 @@ int main(int argc, char **argv) {
             // Collect non-zero critical points
             std::vector<R2> pts;
             std::vector<double> types;
+            std::vector<double> used;
+            std::vector<double> lap;
             for (int i = 0; i < nb_sca; ++i) {
                 if (std::abs(crit_data[i]) < 0.01) continue;
                 pts.push_back(dof_pos[i]);
                 types.push_back(crit_data[i]);
+                used.push_back(crit_used[i]);
+                lap.push_back(mi_laplacian[i]);
             }
 
             std::string fname = g_cfg.output_dir + "/" + iter_prefix + "_crit_points.vtk";
             std::ofstream ofs(fname);
             ofs << "# vtk DataFile Version 3.0\n";
-            ofs << "Critical points of oct shear\n";
+            ofs << "Critical points of miner index\n";
             ofs << "ASCII\n";
             ofs << "DATASET POLYDATA\n";
             ofs << "POINTS " << pts.size() << " double\n";
@@ -1625,6 +1723,14 @@ int main(int argc, char **argv) {
             ofs << "SCALARS crit_type double 1\n";
             ofs << "LOOKUP_TABLE default\n";
             for (double v : types)
+                ofs << v << "\n";
+            ofs << "SCALARS mvee_status double 1\n";
+            ofs << "LOOKUP_TABLE default\n";
+            for (double v : used)
+                ofs << v << "\n";
+            ofs << "SCALARS laplacian double 1\n";
+            ofs << "LOOKUP_TABLE default\n";
+            for (double v : lap)
                 ofs << v << "\n";
             ofs.close();
             std::cout << "  Exported " << pts.size() << " critical points to " << fname << "\n";
@@ -1650,9 +1756,9 @@ int main(int argc, char **argv) {
             {const_cast<fct_t*>(&oct_fh), "oct_shear"},
             {const_cast<fct_t*>(&mi_fh), "miner_index"},
             {const_cast<fct_t*>(&peaks_fh), "mi_peaks"},
-            {const_cast<fct_t*>(&oct_gx_fh), "oct_grad_x"},
-            {const_cast<fct_t*>(&oct_gy_fh), "oct_grad_y"},
-            {const_cast<fct_t*>(&oct_gmag_fh), "oct_grad_mag"},
+            {const_cast<fct_t*>(&mi_gx_fh), "mi_grad_x"},
+            {const_cast<fct_t*>(&mi_gy_fh), "mi_grad_y"},
+            {const_cast<fct_t*>(&mi_gmag_fh), "mi_grad_mag"},
             {&phi_outer_fh, "phi_outer"},
             {&phi_iface_fh, "phi_interface"},
             {&phi_soc_fh, "phi_soc"}
@@ -1711,7 +1817,9 @@ int main(int argc, char **argv) {
     // Iterative loop
     // ============================================================
     std::vector<double> prev_phi_oss_data(nb_sca, -1.0);
+    std::vector<double> phi_oss_smooth(nb_sca, -1.0);  // ellipse-only accumulator for clean export
     double fixed_threshold = 0.0; // computed once at iter 0, reused for all iterations
+    std::vector<R2> prev_ellipse_extremes; // x/y extremes of previous ellipse
     for (int iter = 0; iter < g_cfg.n_iterations; ++iter) {
         std::cout << "\n=== Iteration " << iter << " ===\n";
 
@@ -1751,6 +1859,9 @@ int main(int argc, char **argv) {
         std::span<double> lam_span(lam_data);
         fct_t lambda_fh(Sh, lam_span);
 
+        // Set k_mi for this iteration
+        g_cfg.k_mi = (iter == 0) ? g_cfg.k_mi_nucleation : g_cfg.k_mi_growth;
+
         // Solve
         auto result = run_elasticity(two_mu_fh, lambda_fh);
 
@@ -1776,8 +1887,6 @@ int main(int argc, char **argv) {
         // Threshold is computed once at iter 0 and reused for all iterations
         if (iter == 0) {
             fixed_threshold = find_threshold(result.sf_avg.miner, Sh, Kh);
-            // After iter 0, remove hydrostatic influence: MI = oct_shear only
-            g_cfg.k_mi = 0.0;
         }
         const double threshold = fixed_threshold;
 
@@ -1805,13 +1914,16 @@ int main(int argc, char **argv) {
         }
 
         // ---- Build phi_oss: MI isocontour (iter 0) or ellipse (iter > 0) ----
+        Ellipse2D current_ellipse;  // stored for smooth export trimming
         // Empty diagnostic fields (filled below for iter > 0)
         std::vector<double> peaks_data(nb_sca, 0.0);
         std::vector<double> crit_data(nb_sca, 0.0);
-        GradientField oct_grad;
-        oct_grad.gx.resize(nb_sca, 0.0);
-        oct_grad.gy.resize(nb_sca, 0.0);
-        oct_grad.mag.resize(nb_sca, 0.0);
+        std::vector<double> crit_used(nb_sca, 0.0);
+        std::vector<double> mi_laplacian(nb_sca, 0.0);
+        GradientField mi_grad;
+        mi_grad.gx.resize(nb_sca, 0.0);
+        mi_grad.gy.resize(nb_sca, 0.0);
+        mi_grad.mag.resize(nb_sca, 0.0);
 
         if (iter == 0) {
             // Iteration 0: use MI isocontour directly, no peak/ellipse analysis
@@ -1869,8 +1981,9 @@ int main(int argc, char **argv) {
                           << " (need >= 4 peaks to classify)\n";
             }
 
-            // ---- Critical points of oct shear (max/min/saddle) ----
-            crit_data = find_critical_points(result.sf_avg.oct_shear);
+            // ---- Critical points of MI (max/min/saddle) ----
+            crit_data = find_critical_points(result.sf_avg.miner);
+            mi_laplacian = compute_laplacian(result.sf_avg.miner);
             {
                 int n_max = 0, n_min = 0, n_sad = 0;
                 for (double v : crit_data) {
@@ -1878,14 +1991,14 @@ int main(int argc, char **argv) {
                     else if (v < -0.9) ++n_min;
                     else if (v > 0.1) ++n_sad;
                 }
-                std::cout << "  Oct shear critical points: "
+                std::cout << "  MI critical points: "
                           << n_max << " max, " << n_min << " min, " << n_sad << " saddle\n";
             }
 
-            // ---- Gradient of oct shear ----
-            oct_grad = compute_field_gradient(result.sf_avg.oct_shear);
+            // ---- Gradient of MI ----
+            mi_grad = compute_field_gradient(result.sf_avg.miner);
 
-            // ---- Fit MVEE ellipse from nearby critical points ----
+            // ---- Fit ellipse from nearby critical points ----
             bool used_ellipse = false;
             {
                 // Build dof positions
@@ -1911,48 +2024,96 @@ int main(int argc, char **argv) {
                 }
                 if (n_oss > 0) { cx /= n_oss; cy /= n_oss; }
 
-                // Collect all critical points with distances to SOC center
-                struct CritPt { R2 pos; double dist; };
+                // Collect critical points eligible for ellipse fitting (filtered by type and inhibition zone)
+                struct CritPt { R2 pos; double dist; int iglo; };
                 std::vector<CritPt> crit_pts;
                 for (int i = 0; i < nb_sca; ++i) {
                     if (std::abs(crit_data[i]) < 0.01) continue;
+                    bool is_max = crit_data[i] > 0.9;
+                    bool is_min = crit_data[i] < -0.9;
+                    bool is_sad = !is_max && !is_min;
+                    if (is_max && !g_cfg.crit_use_max) continue;
+                    if (is_min && !g_cfg.crit_use_min) continue;
+                    if (is_sad && !g_cfg.crit_use_saddle) continue;
                     R2 P = dof_pos[i];
+                    // Skip points in the inhibition zone (near outer boundary or interface)
+                    double dist_outer = std::abs(signed_distance_polygon(P, g_polygon));
+                    double dist_iface = P.y - g_cfg.interface_y;
+                    if (dist_outer < g_cfg.oss_spline_band || dist_iface < g_cfg.oss_spline_band)
+                        continue;
                     double dx = P.x - cx, dy = P.y - cy;
-                    crit_pts.push_back({P, std::sqrt(dx*dx + dy*dy)});
+                    crit_pts.push_back({P, std::sqrt(dx*dx + dy*dy), i});
                 }
 
                 if (!crit_pts.empty()) {
-                    // Sort by distance from SOC center
-                    std::sort(crit_pts.begin(), crit_pts.end(),
-                        [](const CritPt &a, const CritPt &b) { return a.dist < b.dist; });
-
-                    // Largest-gap split: find the biggest jump in sorted distances
-                    // to separate the nearby cluster from far outliers
-                    double max_gap = 0;
-                    int split_idx = (int)crit_pts.size(); // default: keep all
-                    for (int i = 1; i < (int)crit_pts.size(); ++i) {
-                        double gap = crit_pts[i].dist - crit_pts[i-1].dist;
-                        if (gap > max_gap) {
-                            max_gap = gap;
-                            split_idx = i;
+                    // Adaptive bimodal filter: sort |Laplacian| values, find
+                    // the largest multiplicative gap between consecutive values.
+                    // If it exceeds crit_lap_gap_factor, drop everything below.
+                    if (g_cfg.crit_lap_gap_factor > 1.0 && crit_pts.size() > 2) {
+                        std::vector<double> lap_sorted;
+                        lap_sorted.reserve(crit_pts.size());
+                        for (auto &cp : crit_pts)
+                            lap_sorted.push_back(std::abs(mi_laplacian[cp.iglo]));
+                        std::sort(lap_sorted.begin(), lap_sorted.end());
+                        double max_ratio = 0.0;
+                        size_t split_idx = 0;
+                        for (size_t j = 0; j + 1 < lap_sorted.size(); ++j) {
+                            if (lap_sorted[j] < 1e-30) continue;
+                            double ratio = lap_sorted[j + 1] / lap_sorted[j];
+                            if (ratio > max_ratio) {
+                                max_ratio = ratio;
+                                split_idx = j;
+                            }
+                        }
+                        if (max_ratio > g_cfg.crit_lap_gap_factor) {
+                            double cutoff = 0.5 * (lap_sorted[split_idx] +
+                                                   lap_sorted[split_idx + 1]);
+                            size_t before = crit_pts.size();
+                            auto it = std::remove_if(crit_pts.begin(), crit_pts.end(),
+                                [&](const CritPt &cp) {
+                                    return std::abs(mi_laplacian[cp.iglo]) < cutoff;
+                                });
+                            crit_pts.erase(it, crit_pts.end());
+                            std::cout << "  Laplacian gap filter (gap="
+                                      << max_ratio << "x, cutoff=" << cutoff
+                                      << "): " << before << " -> "
+                                      << crit_pts.size() << "\n";
                         }
                     }
 
                     std::vector<R2> filtered_pts;
-                    for (int i = 0; i < split_idx; ++i)
-                        filtered_pts.push_back(crit_pts[i].pos);
+                    std::vector<double> filtered_mi;
+                    for (auto &cp : crit_pts) {
+                        filtered_pts.push_back(cp.pos);
+                        filtered_mi.push_back(std::max(0.0, mi_inhibited[cp.iglo]));
+                        crit_used[cp.iglo] = 1.0;
+                    }
 
-                    std::cout << "  Critical points for MVEE: " << filtered_pts.size()
-                              << " / " << crit_pts.size()
-                              << " (largest gap=" << max_gap
-                              << " at dist=" << (split_idx < (int)crit_pts.size()
-                                  ? crit_pts[split_idx].dist : 0.0)
+                    // Mean MI weight for prev extremes (so they don't dominate or vanish)
+                    double mi_mean = 0.0;
+                    for (double v : filtered_mi) mi_mean += v;
+                    if (!filtered_mi.empty()) mi_mean /= filtered_mi.size();
+
+                    // Add x/y extremes of previous ellipse AFTER gap filtering
+                    // so they don't pollute the Laplacian gap detection
+                    std::vector<R2> fit_pts = filtered_pts;
+                    std::vector<double> fit_weights = filtered_mi;
+                    fit_pts.insert(fit_pts.end(),
+                                   prev_ellipse_extremes.begin(),
+                                   prev_ellipse_extremes.end());
+                    fit_weights.resize(fit_pts.size(), mi_mean);
+
+                    std::cout << "  Critical points for " << g_cfg.ellipse_mode
+                              << ": " << fit_pts.size()
+                              << " (" << filtered_pts.size() << " new + "
+                              << prev_ellipse_extremes.size() << " prev extremes"
                               << ", SOC center=" << cx << "," << cy << ")\n";
 
-                    Ellipse2D ellipse = fit_mvee(filtered_pts);
+                    Ellipse2D ellipse = fit_ellipse(fit_pts, fit_weights);
                     if (ellipse.valid) {
                         used_ellipse = true;
-                        // Replace phi_oss_data with the ellipse level set directly.
+                        current_ellipse = ellipse;
+                        // Ossification can only grow: take max of previous and new ellipse.
                         for (int k = 0; k < Kh.nt; ++k) {
                             const auto &FK = Sh[k];
                             for (int j = 0; j < FK.NbDoF(); ++j) {
@@ -1964,21 +2125,44 @@ int main(int argc, char **argv) {
                                     phi_oss_data[iglo] = -1.0;
                                     continue;
                                 }
-                                phi_oss_data[iglo] = eval_phi_ellipse(P, ellipse);
+                                double phi_new = eval_phi_ellipse(P, ellipse);
+                                phi_oss_data[iglo] = std::max(prev_phi_oss_data[iglo], phi_new);
                             }
                         }
                         auto axes = ellipse_axes_from_A(ellipse);
-                        std::cout << "  Ellipse (MVEE from crit pts): center=("
+                        std::cout << "  Ellipse (" << g_cfg.ellipse_mode << " from crit pts): center=("
                                   << ellipse.c0 << "," << ellipse.c1
                                   << "), major=" << axes.major << ", minor=" << axes.minor
                                   << ", aspect=" << axes.aspect << "\n";
+
+                        // Store x/y extremes of this ellipse for next iteration.
+                        // Ellipse boundary: (P-c)^T A (P-c) = 1
+                        // x-extremes: dx = ±sqrt(a11/det), dy = ∓a01*dx/a11
+                        // y-extremes: dy = ±sqrt(a00/det), dx = ∓a01*dy/a00
+                        prev_ellipse_extremes.clear();
+                        double det_A = ellipse.a00 * ellipse.a11 -
+                                       ellipse.a01 * ellipse.a01;
+                        if (det_A > 1e-20) {
+                            double dx_ext = std::sqrt(ellipse.a11 / det_A);
+                            double dy_at_xext = -ellipse.a01 * dx_ext / ellipse.a11;
+                            double dy_ext = std::sqrt(ellipse.a00 / det_A);
+                            double dx_at_yext = -ellipse.a01 * dy_ext / ellipse.a00;
+                            prev_ellipse_extremes.push_back(
+                                R2(ellipse.c0 + dx_ext, ellipse.c1 + dy_at_xext));
+                            prev_ellipse_extremes.push_back(
+                                R2(ellipse.c0 - dx_ext, ellipse.c1 - dy_at_xext));
+                            prev_ellipse_extremes.push_back(
+                                R2(ellipse.c0 + dx_at_yext, ellipse.c1 + dy_ext));
+                            prev_ellipse_extremes.push_back(
+                                R2(ellipse.c0 - dx_at_yext, ellipse.c1 - dy_ext));
+                        }
                     }
                 }
             }
 
-            // Fallback: MI isocontour if MVEE failed
+            // Fallback: MI isocontour if ellipse fitting failed
             if (!used_ellipse) {
-                std::cout << "  MVEE failed, using MI isocontour fallback\n";
+                std::cout << "  " << g_cfg.ellipse_mode << " failed, using MI isocontour fallback\n";
                 for (int k = 0; k < Kh.nt; ++k) {
                     const auto &FK = Sh[k];
                     for (int j = 0; j < FK.NbDoF(); ++j) {
@@ -2002,20 +2186,43 @@ int main(int argc, char **argv) {
             int n_ossified = 0;
             for (int i = 0; i < nb_sca; ++i)
                 if (phi_oss_data[i] >= 0.0) ++n_ossified;
-            std::cout << "  Ossified nodes (" << (used_ellipse ? "MVEE" : "MI iso")
+            std::cout << "  Ossified nodes (" << (used_ellipse ? g_cfg.ellipse_mode : "MI iso")
                       << "): " << n_ossified << " / " << nb_sca << "\n";
         }
 
         // Build FE functions for diagnostic fields
         std::span<double> peaks_span(peaks_data);
         fct_t peaks_fh(Sh, peaks_span);
-        std::span<double> gx_span(oct_grad.gx), gy_span(oct_grad.gy), gmag_span(oct_grad.mag);
-        fct_t oct_gx_fh(Sh, gx_span), oct_gy_fh(Sh, gy_span), oct_gmag_fh(Sh, gmag_span);
+        std::span<double> gx_span(mi_grad.gx), gy_span(mi_grad.gy), gmag_span(mi_grad.mag);
+        fct_t mi_gx_fh(Sh, gx_span), mi_gy_fh(Sh, gy_span), mi_gmag_fh(Sh, gmag_span);
+        std::span<double> lap_span(mi_laplacian);
+        fct_t mi_lap_fh(Sh, lap_span);
+
+        // Export with the smooth accumulator (shows the ellipse used for THIS solve)
+        for (int i = 0; i < nb_sca; ++i)
+            prev_phi_oss_span[i] = phi_oss_smooth[i];
 
         // Export VTK
         export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
                          phi_soc_fh, prev_phi_oss_data, peaks_fh, crit_data,
-                         oct_gx_fh, oct_gy_fh, oct_gmag_fh);
+                         crit_used, mi_laplacian, mi_lap_fh, mi_gx_fh, mi_gy_fh, mi_gmag_fh);
+
+        // NOW accumulate this iteration's ellipse into the smooth export level-set
+        if (current_ellipse.valid) {
+            for (int k = 0; k < Kh.nt; ++k) {
+                const auto &FK = Sh[k];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(k, j);
+                    if (iglo < 0 || iglo >= nb_sca) continue;
+                    R2 P = FK.Pt(j);
+                    if (P.y < g_cfg.interface_y ||
+                        signed_distance_polygon(P, g_polygon) > 0.0)
+                        continue;
+                    double phi_e = eval_phi_ellipse(P, current_ellipse);
+                    phi_oss_smooth[iglo] = std::max(phi_oss_smooth[iglo], phi_e);
+                }
+            }
+        }
 
         // Store ossification for next iteration material update
         prev_phi_oss_data = phi_oss_data;

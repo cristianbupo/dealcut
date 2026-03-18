@@ -1,7 +1,5 @@
 {
-  "n_iterations": 20,
-  "export_cartilage": false,
-  "export_active": false,
+  "n_iterations": 30,
   "export_trimmed": true,
   "p1_geom": 0.9,
   "p2_geom": 0.2,
@@ -12,7 +10,7 @@
   "k_mi_nucleation": 0.5,
   "k_mi_growth": 0.5,
   "oss_spline_band": 0.3,
-  "ellipse_mode": "outer_mvee",
+  "ellipse_mode": "regression",
   "ellipse_dilation": 1.05,
   "ellipse_max_aspect": 6.0,
   "load_center_u_frac": 0.5,
@@ -20,7 +18,10 @@
   "load_radius_scale": 1.0,
   "load_p_peak": 1.0,
   "mesh_nx": 400,
-  "mesh_y_offset": -0.00113,
-  "output_dir": "output/cvx_hydg",
-  "gmsh_model_name": "cvx_hydg"
+  "mesh_y_offset": 0.0,
+  "output_dir": "output/regression_convex_2",
+  "gmsh_model_name": "regression_convex_2",
+  "crit_use_min": true,
+  "crit_use_saddle": false,
+  "crit_lap_gap_factor": 5.0
 }

@@ -8,18 +8,11 @@
   "interface_y": 1.0,
   "oss_height_target": 0.05,
   "k_mi_nucleation": 0.5,
-  "k_mi_growth": 0.0,
-  "hyd_ignore_positive": true,
+  "k_mi_growth": 0.5,
   "oss_spline_band": 0.3,
   "ellipse_mode": "outer_mvee",
-  "ellipse_active_quantile": 0.9,
-  "ellipse_threshold_scale": 1.0,
   "ellipse_dilation": 1.05,
-  "ellipse_min_points": 8,
   "ellipse_max_aspect": 6.0,
-  "ellipse_use_inhibition": true,
-  "ellipse_use_interface_inhibition": true,
-  "ellipse_interface_band": 0.15,
   "load_center_u_frac": 0.5,
   "load_du_frac": 0.08,
   "load_radius_scale": 1.0,
@@ -27,5 +20,7 @@
   "mesh_nx": 400,
   "mesh_y_offset": -0.00113,
   "output_dir": "output/test_crit",
-  "gmsh_model_name": "test_crit"
+  "gmsh_model_name": "test_crit",
+  "crit_use_min": false,
+  "crit_use_saddle": false
 }

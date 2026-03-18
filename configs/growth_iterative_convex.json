@@ -11,7 +11,6 @@
   "oss_height_target": 0.05,
   "k_mi_nucleation": 0.5,
   "k_mi_growth": 0.0,
-  "hyd_ignore_positive": true,
   "oss_spline_band": 0.3,
   "load_center_u_frac": 0.5,
   "load_du_frac": 0.08,
