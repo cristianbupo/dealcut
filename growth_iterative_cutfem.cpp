@@ -61,6 +61,10 @@ struct SimConfig {
     int mesh_nx = 200;
     double mesh_y_offset = -0.00113;
 
+    double poisson_source = -1.0; // f in -Δu + αu = f (negative = consumption)
+    double poisson_flux   =  1.0; // flux from ossification front into cartilage
+    double poisson_decay  =  0.1; // α: natural decay rate (regularizes pure Neumann)
+
     std::string output_dir = "output/growth_iterative";
     std::string gmsh_model_name = "growth_iterative_cutfem";
 };
@@ -158,6 +162,9 @@ static bool load_config_from_json(const std::string &path, SimConfig &cfg) {
 
     parse_json_int(text, "mesh_nx", cfg.mesh_nx);
     parse_json_number(text, "mesh_y_offset", cfg.mesh_y_offset);
+    parse_json_number(text, "poisson_source", cfg.poisson_source);
+    parse_json_number(text, "poisson_flux", cfg.poisson_flux);
+    parse_json_number(text, "poisson_decay", cfg.poisson_decay);
 
     parse_json_string(text, "output_dir", cfg.output_dir);
     parse_json_string(text, "gmsh_model_name", cfg.gmsh_model_name);
@@ -753,7 +760,7 @@ static void write_trimmed_both_vtk(
     fct_t *vec_fh = nullptr,
     const std::string &vec_name = "")
 {
-    struct Cell { std::vector<R2> nodes; int kb; };
+    struct Cell { std::vector<R2> nodes; int kb; int domain = 0; };
     std::vector<Cell> cells;
 
     int nact = Khi.get_nb_element();
@@ -776,19 +783,61 @@ static void write_trimmed_both_vtk(
             polys = std::move(next);
         }
 
-        // Two-sided splits: keep both sub-cells at each material interface
-        for (auto &phi : split_levelsets) {
+        // Two-sided splits with domain tracking:
+        // bit i of domain = 0 → cell is on phi < 0 side of split i
+        // bit i of domain = 1 → cell is on phi >= 0 side of split i
+        std::vector<int> domains(polys.size(), 0);
+        for (int si = 0; si < (int)split_levelsets.size(); ++si) {
+            auto &phi = split_levelsets[si];
             std::vector<std::vector<R2>> next;
-            for (auto &poly : polys) {
+            std::vector<int> next_domains;
+            for (size_t pi = 0; pi < polys.size(); ++pi) {
+                auto &poly = polys[pi];
+                int n = (int)poly.size();
+                if (n < 3) continue;
                 std::vector<double> vals;
-                vals.reserve(poly.size());
+                vals.reserve(n);
                 for (auto &p : poly) vals.push_back(phi(p, kb));
-                clip_polygon_both_sides(poly, vals, next);
+
+                bool all_neg = true, all_pos = true;
+                for (double v : vals) { if (v >= 0) all_neg = false; if (v < 0) all_pos = false; }
+
+                if (all_neg) {
+                    next.push_back(std::move(poly));
+                    next_domains.push_back(domains[pi]);
+                } else if (all_pos) {
+                    next.push_back(std::move(poly));
+                    next_domains.push_back(domains[pi] | (1 << si));
+                } else {
+                    std::vector<R2> neg, pos;
+                    for (int i = 0; i < n; ++i) {
+                        int j = (i + 1) % n;
+                        if (vals[i] < 0) neg.push_back(poly[i]);
+                        else             pos.push_back(poly[i]);
+                        if ((vals[i] < 0) != (vals[j] < 0)) {
+                            double t = vals[i] / (vals[i] - vals[j]);
+                            R2 x(poly[i].x + t*(poly[j].x - poly[i].x),
+                                 poly[i].y + t*(poly[j].y - poly[i].y));
+                            neg.push_back(x);
+                            pos.push_back(x);
+                        }
+                    }
+                    if ((int)neg.size() >= 3) {
+                        next.push_back(std::move(neg));
+                        next_domains.push_back(domains[pi]);
+                    }
+                    if ((int)pos.size() >= 3) {
+                        next.push_back(std::move(pos));
+                        next_domains.push_back(domains[pi] | (1 << si));
+                    }
+                }
             }
             polys = std::move(next);
+            domains = std::move(next_domains);
         }
 
-        for (auto &poly : polys) cells.push_back({std::move(poly), kb});
+        for (size_t pi = 0; pi < polys.size(); ++pi)
+            cells.push_back({std::move(polys[pi]), kb, domains[pi]});
     }
 
     int total_nodes = 0;
@@ -839,8 +888,22 @@ static void write_trimmed_both_vtk(
             }
     }
 
-    if (!cell_fields.empty() || !cell_fns.empty()) {
+    {
         out << "CELL_DATA " << cells.size() << "\n";
+
+        // domain: bitmask from split_levelsets (bit i = side of split i)
+        out << "SCALARS domain float\n"
+            << "LOOKUP_TABLE default\n";
+        for (auto &c : cells) out << c.domain << "\n";
+
+        // material_sharp: derived from domain (exact, no interpolation)
+        // split 0: P.y - interface_y  → bit 0 = 1 means above interface
+        // split 1: phi_soc            → bit 1 = 1 means ossified
+        // domain == 1 (above, not ossified) → cartilage (0), else → bone (1)
+        out << "SCALARS material_sharp float\n"
+            << "LOOKUP_TABLE default\n";
+        for (auto &c : cells) out << ((c.domain == 1) ? 0.0 : 1.0) << "\n";
+
         for (auto &[fh, name] : cell_fields) {
             out << "SCALARS " << name << " float\n"
                 << "LOOKUP_TABLE default\n";
@@ -956,7 +1019,11 @@ int main(int argc, char **argv) {
             if (iglo < 0 || iglo >= nb_sca) continue;
             R2 P = FK.Pt(j);
             phi_outer_data[iglo] = signed_distance_polygon(P, g_polygon);
-            phi_iface_data[iglo] = P.y - g_cfg.interface_y;
+            double phi_y = P.y - g_cfg.interface_y;
+            // If a node sits exactly on the interface, nudge it below
+            // to avoid degenerate CutFEM cuts
+            if (std::abs(phi_y) < 1e-10) phi_y = -1e-10;
+            phi_iface_data[iglo] = phi_y;
         }
     }
     std::span<double> phi_outer_span(phi_outer_data);
@@ -1053,7 +1120,8 @@ int main(int argc, char **argv) {
                                 const fct_t &hd_fh, const fct_t &oct_fh,
                                 const fct_t &mi_fh, const fct_t &mat_fh,
                                 fct_t &phi_soc_fh,
-                                const std::vector<double> &phi_oss_data)
+                                const std::vector<double> &phi_oss_data,
+                                fct_t *poisson_fh = nullptr)
     {
         std::string tag = std::to_string(iter);
         const std::string output_prefix = std::filesystem::path(g_cfg.output_dir).filename().string();
@@ -1082,6 +1150,7 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            if (poisson_fh) w.add(*poisson_fh, "poisson_u", 0, 1);
         }
 
         // Active elements (full quads)
@@ -1096,6 +1165,7 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            if (poisson_fh) w.add(*poisson_fh, "poisson_u", 0, 1);
         }
 
         // Trimmed both sides
@@ -1121,19 +1191,13 @@ int main(int argc, char **argv) {
             {&phi_iface_fh, "phi_interface"},
             {&phi_soc_fh, "phi_soc"}
         };
-
-        // material_sharp: hard 0/1 assignment using current ossification front
-        CellFn mat_sharp = {[&phi_soc_fh](const R2& P, int kb) -> double {
-            if (P.y < g_cfg.interface_y) return 1.0;
-            if (phi_soc_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0) return 1.0;
-            return 0.0;
-        }, "material_sharp"};
+        if (poisson_fh) sca.push_back({poisson_fh, "poisson_u"});
 
         write_trimmed_both_vtk(
             g_cfg.output_dir + "/" + iter_prefix + "_trimmed.vtk", Khi,
             soc_boundary_clip, interface_splits, sca,
             {{const_cast<fct_t*>(&mat_fh), "material"}},
-            {mat_sharp},
+            {},
             const_cast<fct_t*>(&uh_avg), "displacement");
         }
 
@@ -1168,6 +1232,7 @@ int main(int argc, char **argv) {
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
+            if (poisson_fh) w.add(*poisson_fh, "poisson_u", 0, 1);
         }
     };
 
@@ -1232,15 +1297,6 @@ int main(int argc, char **argv) {
         std::span<double> mat_span(mat_data);
         fct_t mat_fh(Sh, mat_span);
 
-        // phi_soc_fh for export: use prev_phi_oss_data (the ossification that was
-        // applied as material for this solve), not the newly computed one
-        std::span<double> prev_phi_oss_span(prev_phi_oss_data);
-        fct_t phi_soc_fh(Sh, prev_phi_oss_span);
-
-        // Export VTK (shows the state used in the current solve)
-        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
-                         phi_soc_fh, prev_phi_oss_data);
-
         // Threshold is computed once at iter 0 and reused for all iterations
         if (iter == 0)
             fixed_threshold = find_threshold(result.sf_avg.miner, Sh, Kh);
@@ -1280,6 +1336,118 @@ int main(int argc, char **argv) {
         for (int i = 0; i < nb_sca; ++i)
             if (phi_oss_data[i] >= 0.0) ++n_ossified;
         std::cout << "  Ossified nodes (current): " << n_ossified << " / " << nb_sca << "\n";
+
+        // ---- Reaction-diffusion on upper SOC domain ----
+        // -Δu + αu = f (consumption in cartilage, decay everywhere)
+        // ∂u/∂n = flux on ossification front (substance invading cartilage)
+        // ∇u·n = 0 on SOC outer & interface_y (free boundary)
+        std::vector<double> poisson_data(nb_sca, 0.0);
+        std::span<double> poisson_span(poisson_data);
+
+        if (n_ossified > 0 && iter > 0) {
+            std::cout << "  Solving Poisson on cartilage domain...\n";
+
+            // Ossification level set and interface
+            std::span<double> oss_p_span(phi_oss_data);
+            fct_t phi_oss_fh(Sh, oss_p_span);
+            InterfaceLevelSet<mesh_t> oss_interface(Kh, phi_oss_fh);
+
+            // Upper SOC domain: max(phi_outer, interface_y - y) < 0
+            std::vector<double> phi_upper_data(nb_sca);
+            for (int k = 0; k < Kh.nt; ++k) {
+                const auto &FK = Sh[k];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(k, j);
+                    if (iglo < 0 || iglo >= nb_sca) continue;
+                    R2 P = FK.Pt(j);
+                    phi_upper_data[iglo] = std::max(
+                        signed_distance_polygon(P, g_polygon),
+                        g_cfg.interface_y - P.y);
+                }
+            }
+            std::span<double> phi_upper_span(phi_upper_data);
+            fct_t phi_upper_fh(Sh, phi_upper_span);
+            InterfaceLevelSet<mesh_t> upper_interface(Kh, phi_upper_fh);
+
+            cutmesh_t Khi_upper(Kh);
+            Khi_upper.truncate(upper_interface, 1);
+
+            // Scalar P1 CutFE space
+            cutspace_t Wh_p(Khi_upper, Sh);
+            int nb_dof_p = Wh_p.get_nb_dof();
+
+            CutFEM<mesh_t> poisson(Wh_p);
+            funtest_t u_p(Wh_p, 1, 0), v_p(Wh_p, 1, 0);
+
+            double penalty_p = 80.0;
+
+            // ∫ ∇u·∇v + α∫ u·v  (reaction-diffusion, α > 0 regularizes pure Neumann)
+            poisson.addBilinear(
+                innerProduct(grad(u_p), grad(v_p))
+                + innerProduct(g_cfg.poisson_decay * u_p, v_p),
+                Khi_upper);
+
+            // ∇u·n = 0 on SOC outer & interface_y (natural, no terms needed)
+
+            // Flux from ossification front: ∫ flux·v ds
+            fct_t flux_fh(Sh, [](R2 P, int i, int dom) -> double {
+                return g_cfg.poisson_flux;
+            });
+            poisson.addLinear(
+                innerProduct(flux_fh.expr(), v_p),
+                oss_interface);
+
+            // Source term: ∫ f·v in cartilage (phi_oss < 0, above interface_y)
+            fct_t source_fh(Sh, [](R2 P, int i, int dom) -> double {
+                return g_cfg.poisson_source;
+            });
+            std::vector<double> cart_mask_vec(nb_sca, 0.0);
+            for (int i = 0; i < nb_sca; ++i)
+                if (phi_oss_data[i] < 0.0) cart_mask_vec[i] = 1.0;
+            std::span<double> cart_mask_span(cart_mask_vec);
+            fct_t oss_mask_fh(Sh, cart_mask_span);
+            poisson.addLinear(
+                innerProduct(oss_mask_fh.expr() * source_fh.expr(), v_p),
+                Khi_upper);
+
+            // Ghost-penalty stabilization
+            poisson.addFaceStabilization(
+                innerProduct(ghost_param * pow(h,-1) * jump(u_p), jump(v_p))
+                + innerProduct(ghost_param * pow(h,1) * jump(grad(u_p)*n), jump(grad(v_p)*n)),
+                Khi_upper);
+
+            poisson.solve("umfpack");
+
+            // Project CutFE solution onto Sh (full mesh) for unified export
+            std::span<double> poisson_sol(poisson.rhs_.data(), nb_dof_p);
+            fct_t poisson_cut(Wh_p, poisson_sol);
+
+            int nact_upper = Khi_upper.get_nb_element();
+            for (int ka = 0; ka < nact_upper; ++ka) {
+                int kb = Khi_upper.idxElementInBackMesh(ka);
+                const auto &FK = Sh[kb];
+                for (int j = 0; j < FK.NbDoF(); ++j) {
+                    int iglo = Sh(kb, j);
+                    if (iglo < 0 || iglo >= nb_sca) continue;
+                    R2 P = FK.Pt(j);
+                    poisson_data[iglo] = poisson_cut.eval(ka, (const double*)&P, 0, 0);
+                }
+            }
+            std::cout << "  Poisson solved, DOFs=" << nb_dof_p << "\n";
+        }
+
+        // Build poisson FE function on Sh AFTER data is populated (or zeros for iter 0)
+        fct_t poisson_sh(Sh, poisson_span);
+        fct_t *poisson_fh_ptr = &poisson_sh;
+
+        // phi_soc_fh for export: use prev_phi_oss_data (the ossification that was
+        // applied as material for this solve), not the newly computed one
+        std::span<double> prev_phi_oss_span(prev_phi_oss_data);
+        fct_t phi_soc_fh(Sh, prev_phi_oss_span);
+
+        // Export VTK (shows the state used in the current solve + Poisson from new front)
+        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
+                         phi_soc_fh, prev_phi_oss_data, poisson_fh_ptr);
 
         // Store ossification for next iteration material update
         prev_phi_oss_data = phi_oss_data;
