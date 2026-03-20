@@ -61,9 +61,13 @@ struct SimConfig {
     int mesh_nx = 200;
     double mesh_y_offset = -0.00113;
 
+    double mi_threshold_frac = 0.9; // fraction of selected max MI used as threshold
+
     double poisson_source = -1.0; // f in -Δu + αu = f (negative = consumption)
     double poisson_flux   =  1.0; // flux from ossification front into cartilage
     double poisson_decay  =  0.1; // α: natural decay rate (regularizes pure Neumann)
+    bool poisson_dirichlet_outer = true;  // Dirichlet u=0 on SOC outer boundary
+    bool poisson_dirichlet_iface = true;  // Dirichlet u=0 on bone-cartilage interface
 
     std::string output_dir = "output/growth_iterative";
     std::string gmsh_model_name = "growth_iterative_cutfem";
@@ -162,9 +166,12 @@ static bool load_config_from_json(const std::string &path, SimConfig &cfg) {
 
     parse_json_int(text, "mesh_nx", cfg.mesh_nx);
     parse_json_number(text, "mesh_y_offset", cfg.mesh_y_offset);
+    parse_json_number(text, "mi_threshold_frac", cfg.mi_threshold_frac);
     parse_json_number(text, "poisson_source", cfg.poisson_source);
     parse_json_number(text, "poisson_flux", cfg.poisson_flux);
     parse_json_number(text, "poisson_decay", cfg.poisson_decay);
+    parse_json_bool(text, "poisson_dirichlet_outer", cfg.poisson_dirichlet_outer);
+    parse_json_bool(text, "poisson_dirichlet_iface", cfg.poisson_dirichlet_iface);
 
     parse_json_string(text, "output_dir", cfg.output_dir);
     parse_json_string(text, "gmsh_model_name", cfg.gmsh_model_name);
@@ -196,6 +203,24 @@ static constexpr double lambda_cart = E_cart * nu_cart / ((1.0 + nu_cart) * (1.0
 // Ossification parameters
 
 struct StepDef { double u_center, u_radius, p_peak; };
+
+enum class Phase { MI, POISSON };
+
+static const char* phase_name(Phase p) {
+    return (p == Phase::MI) ? "MI" : "Poisson";
+}
+
+// Schedule: MI, MI, then alternating Poisson/MI
+static std::vector<Phase> build_phase_schedule(int n_iterations) {
+    std::vector<Phase> schedule;
+    for (int i = 0; i < n_iterations; ++i) {
+        if (i < 2)
+            schedule.push_back(Phase::MI);
+        else
+            schedule.push_back((i % 2 == 0) ? Phase::POISSON : Phase::MI);
+    }
+    return schedule;
+}
 
 // ============================================================
 // Globals
@@ -681,6 +706,29 @@ static double find_threshold(const std::vector<double> &mi_nodal,
               << ", mi range(axis)=[" << mi_min_ax << ", " << mi_max_ax << "]\n";
 
     return threshold;
+}
+
+// ============================================================
+// Poisson threshold: minimum Poisson value at ossification interface
+// ============================================================
+static double compute_poisson_threshold(
+    const std::vector<double> &poisson_data,
+    const std::vector<double> &phi_oss_data,
+    const std::vector<double> &pre_mi_phi_oss_data,
+    int nb_sca)
+{
+    double min_val = std::numeric_limits<double>::max();
+    int count = 0;
+    // Newly ossified nodes: was cartilage before last MI step, now ossified
+    for (int i = 0; i < nb_sca; ++i) {
+        if (phi_oss_data[i] >= 0.0 && pre_mi_phi_oss_data[i] < 0.0) {
+            min_val = std::min(min_val, poisson_data[i]);
+            ++count;
+        }
+    }
+    std::cout << "  Poisson threshold: " << min_val
+              << " (from " << count << " newly-ossified nodes)\n";
+    return (count > 0) ? min_val : 0.0;
 }
 
 // ============================================================
@@ -1237,22 +1285,142 @@ int main(int argc, char **argv) {
     };
 
     // ============================================================
+    // Critical point detection (gradient + Laplacian classification)
+    // ============================================================
+    struct GradientField { std::vector<double> gx, gy, mag; };
+
+    auto find_critical_points = [&](const std::vector<double> &field) -> std::vector<double>
+    {
+        std::vector<std::vector<int>> adj(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            int ndf = FK.NbDoF();
+            for (int i = 0; i < ndf; ++i) {
+                int gi = Sh(k, i);
+                if (gi < 0 || gi >= nb_sca) continue;
+                for (int j = 0; j < ndf; ++j) {
+                    if (i == j) continue;
+                    int gj = Sh(k, j);
+                    if (gj < 0 || gj >= nb_sca) continue;
+                    adj[gi].push_back(gj);
+                }
+            }
+        }
+        for (auto &v : adj) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+
+        std::vector<R2> dof_pos(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            for (int j = 0; j < FK.NbDoF(); ++j) {
+                int iglo = Sh(k, j);
+                if (iglo >= 0 && iglo < nb_sca)
+                    dof_pos[iglo] = FK.Pt(j);
+            }
+        }
+
+        std::vector<double> crit(nb_sca, 0.0);
+        for (int i = 0; i < nb_sca; ++i) {
+            R2 Pi = dof_pos[i];
+            if (Pi.y < g_cfg.interface_y) continue;
+            if (signed_distance_polygon(Pi, g_polygon) > 0.0) continue;
+            if (adj[i].size() < 3) continue;
+
+            std::vector<std::pair<double, int>> angle_nb;
+            for (int nb : adj[i]) {
+                R2 Pn = dof_pos[nb];
+                double ang = std::atan2(Pn.y - Pi.y, Pn.x - Pi.x);
+                angle_nb.push_back({ang, nb});
+            }
+            std::sort(angle_nb.begin(), angle_nb.end());
+
+            bool all_below = true, all_above = true;
+            for (auto &[ang, nb] : angle_nb) {
+                if (field[nb] >= field[i]) all_below = false;
+                if (field[nb] <= field[i]) all_above = false;
+            }
+
+            if (all_below) { crit[i] = 1.0; continue; }   // local maximum
+            if (all_above) { crit[i] = -1.0; continue; }   // local minimum
+
+            std::vector<int> signs;
+            for (auto &[ang, nb] : angle_nb) {
+                double diff = field[nb] - field[i];
+                if (diff > 0) signs.push_back(1);
+                else if (diff < 0) signs.push_back(-1);
+            }
+            if ((int)signs.size() < 4) continue;
+
+            int n_changes = 0;
+            for (int j = 1; j < (int)signs.size(); ++j)
+                if (signs[j] != signs[j-1]) ++n_changes;
+            if (signs.back() != signs.front()) ++n_changes;
+
+            if (n_changes >= 4) crit[i] = 0.5; // saddle point
+        }
+        return crit;
+    };
+
+    auto compute_laplacian = [&](const std::vector<double> &field) -> std::vector<double>
+    {
+        std::vector<std::vector<int>> adj(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            int ndf = FK.NbDoF();
+            for (int i = 0; i < ndf; ++i) {
+                int gi = Sh(k, i);
+                if (gi < 0 || gi >= nb_sca) continue;
+                for (int j = 0; j < ndf; ++j) {
+                    if (i == j) continue;
+                    int gj = Sh(k, j);
+                    if (gj < 0 || gj >= nb_sca) continue;
+                    adj[gi].push_back(gj);
+                }
+            }
+        }
+        for (auto &v : adj) {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+
+        std::vector<double> lap(nb_sca, 0.0);
+        for (int i = 0; i < nb_sca; ++i) {
+            if (adj[i].empty()) continue;
+            double sum = 0.0;
+            for (int nb : adj[i])
+                sum += field[nb] - field[i];
+            lap[i] = sum / (double)adj[i].size();
+        }
+        return lap;
+    };
+
+    // ============================================================
     // Iterative loop
     // ============================================================
+    auto phase_schedule = build_phase_schedule(g_cfg.n_iterations);
     std::vector<double> prev_phi_oss_data(nb_sca, -1.0);
-    double fixed_threshold = 0.0; // computed once at iter 0, reused for all iterations
-    for (int iter = 0; iter < g_cfg.n_iterations; ++iter) {
-        std::cout << "\n=== Iteration " << iter << " ===\n";
+    double mi_threshold = 0.0;
 
-        // Build material coefficients for this iteration:
-        //   bone region (y < interfaceY):  always bone
-        //   cartilage (y >= interface):    cartilage
+    // Persistent storage for last MI-phase results (reused in Poisson-phase export)
+    std::vector<double> last_U_avg(nb_dof, 0.0);
+    std::vector<double> last_hd(nb_sca, 0.0), last_oct(nb_sca, 0.0), last_mi(nb_sca, 0.0);
+    std::vector<double> last_mat(nb_sca, 0.0);
+    std::vector<double> pre_mi_phi_oss_data(nb_sca, -1.0); // state before last MI update
+    RunResult last_mi_result;
+
+    for (int iter = 0; iter < g_cfg.n_iterations; ++iter) {
+        Phase phase = phase_schedule[iter];
+        std::cout << "\n=== Iteration " << iter << " | Phase = " << phase_name(phase) << " ===\n";
+
+        std::vector<double> phi_oss_data(nb_sca, -1.0);
+
+        if (phase == Phase::MI) {
+        // ---- MI PHASE: mechanical solve -> MI field -> threshold -> level set ----
 
         std::vector<double> tmu_data(nb_sca), lam_data(nb_sca);
         std::vector<double> mat_data(nb_sca, 0.0);
-
-        // Current ossification level set data (from current iteration's MI)
-        std::vector<double> phi_oss_data(nb_sca, -1.0);
 
         // Base material, with carry-over ossification from previous iteration
         for (int k = 0; k < Kh.nt; ++k) {
@@ -1297,60 +1465,195 @@ int main(int argc, char **argv) {
         std::span<double> mat_span(mat_data);
         fct_t mat_fh(Sh, mat_span);
 
-        // Threshold is computed once at iter 0 and reused for all iterations
-        if (iter == 0)
-            fixed_threshold = find_threshold(result.sf_avg.miner, Sh, Kh);
-        const double threshold = fixed_threshold;
+        std::cout << "  DOFs (elasticity) = " << nb_dof << "\n";
 
-        // Build current ossification level set from current MI.
-        // Use max(prev, new) to preserve smooth contour across iterations
-        // while ensuring the front only advances (irreversible).
+        // ---- Critical point analysis on MI field ----
+        auto crit_data = find_critical_points(result.sf_avg.miner);
+        auto mi_laplacian = compute_laplacian(result.sf_avg.miner);
+
+        // Build DOF positions for critical point export and SOC distance
+        std::vector<R2> dof_pos(nb_sca);
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            for (int j = 0; j < FK.NbDoF(); ++j) {
+                int iglo = Sh(k, j);
+                if (iglo >= 0 && iglo < nb_sca)
+                    dof_pos[iglo] = FK.Pt(j);
+            }
+        }
+
+        // Collect local maxima (crit == 1.0), select the highest MI near the SOC surface
+        // Status: 0=unused, 1=candidate max, 2=selected max
+        std::vector<double> crit_status(nb_sca, 0.0);
+
+        // Gather all maxima with their distance to ossification front
+        struct MaxCandidate { int iglo; double mi_val; double dist_to_oss; };
+        std::vector<MaxCandidate> max_candidates;
+
+        // Collect ossified node positions for distance computation
+        std::vector<R2> oss_front_pts;
+        for (int i = 0; i < nb_sca; ++i) {
+            if (prev_phi_oss_data[i] >= 0.0)
+                oss_front_pts.push_back(dof_pos[i]);
+        }
+
+        int n_max = 0, n_min = 0, n_saddle = 0;
+        for (int i = 0; i < nb_sca; ++i) {
+            if (crit_data[i] > 0.9) {
+                ++n_max;
+                crit_status[i] = 1.0;
+                double dist_oss = std::numeric_limits<double>::max();
+                for (auto &op : oss_front_pts) {
+                    double dx = dof_pos[i].x - op.x;
+                    double dy = dof_pos[i].y - op.y;
+                    dist_oss = std::min(dist_oss, std::sqrt(dx*dx + dy*dy));
+                }
+                max_candidates.push_back({i, result.sf_avg.miner[i], dist_oss});
+            } else if (crit_data[i] < -0.9) {
+                ++n_min;
+            } else if (std::abs(crit_data[i] - 0.5) < 0.1) {
+                ++n_saddle;
+            }
+        }
+
+        // Select best candidate: weighted score of MI value and proximity to ossification front
+        double best_mi_val = -std::numeric_limits<double>::max();
+        int best_iglo = -1;
+        if (!oss_front_pts.empty()) {
+            double best_score = -std::numeric_limits<double>::max();
+            for (auto &c : max_candidates) {
+                double score = c.mi_val / (1.0 + c.dist_to_oss / g_cfg.oss_spline_band);
+                if (score > best_score) {
+                    best_score = score;
+                    best_iglo = c.iglo;
+                    best_mi_val = c.mi_val;
+                }
+            }
+        } else {
+            // No ossification front yet, select highest MI
+            for (auto &c : max_candidates) {
+                if (c.mi_val > best_mi_val) {
+                    best_mi_val = c.mi_val;
+                    best_iglo = c.iglo;
+                }
+            }
+        }
+        if (best_iglo >= 0)
+            crit_status[best_iglo] = 2.0; // selected
+
+        std::cout << "  Critical points: " << n_max << " max, " << n_min << " min, "
+                  << n_saddle << " saddle\n";
+
+        if (iter == 0) {
+            // Iteration 0: use target-height bisection approach
+            mi_threshold = find_threshold(result.sf_avg.miner, Sh, Kh);
+            std::cout << "  Threshold (MI, target-height) = " << mi_threshold << "\n";
+        } else if (best_iglo >= 0) {
+            mi_threshold = g_cfg.mi_threshold_frac * best_mi_val;
+            double sel_dist_oss = 0.0;
+            for (auto &c : max_candidates) {
+                if (c.iglo == best_iglo) { sel_dist_oss = c.dist_to_oss; break; }
+            }
+            std::cout << "  Selected max: node " << best_iglo
+                      << " at (" << dof_pos[best_iglo].x << ", " << dof_pos[best_iglo].y << ")"
+                      << ", MI=" << best_mi_val
+                      << ", dist_to_oss_front=" << sel_dist_oss << "\n";
+            std::cout << "  Threshold (MI) = " << g_cfg.mi_threshold_frac << " * " << best_mi_val
+                      << " = " << mi_threshold << "\n";
+        } else {
+            std::cout << "  WARNING: no local maxima found, keeping previous threshold = "
+                      << mi_threshold << "\n";
+        }
+
+        // Export critical points as VTK point cloud
+        {
+            std::string tag = std::to_string(iter);
+            const std::string output_prefix = std::filesystem::path(g_cfg.output_dir).filename().string();
+            std::string fname = g_cfg.output_dir + "/" + output_prefix + "_iter_" + tag + "_crit_points.vtk";
+
+            std::vector<R2> pts;
+            std::vector<double> types, statuses, laps, mi_vals;
+            for (int i = 0; i < nb_sca; ++i) {
+                if (std::abs(crit_data[i]) < 0.01) continue;
+                pts.push_back(dof_pos[i]);
+                types.push_back(crit_data[i]);
+                statuses.push_back(crit_status[i]);
+                laps.push_back(mi_laplacian[i]);
+                mi_vals.push_back(result.sf_avg.miner[i]);
+            }
+
+            std::ofstream ofs(fname);
+            ofs << "# vtk DataFile Version 3.0\n"
+                << "Critical points of miner index\n"
+                << "ASCII\n"
+                << "DATASET POLYDATA\n"
+                << "POINTS " << pts.size() << " double\n";
+            for (auto &P : pts)
+                ofs << P.x << " " << P.y << " 0.0\n";
+            ofs << "VERTICES " << pts.size() << " " << 2 * pts.size() << "\n";
+            for (int i = 0; i < (int)pts.size(); ++i)
+                ofs << "1 " << i << "\n";
+            ofs << "POINT_DATA " << pts.size() << "\n";
+            ofs << "SCALARS crit_type double 1\nLOOKUP_TABLE default\n";
+            for (double v : types) ofs << v << "\n";
+            ofs << "SCALARS status double 1\nLOOKUP_TABLE default\n";
+            for (double v : statuses) ofs << v << "\n";
+            ofs << "SCALARS laplacian double 1\nLOOKUP_TABLE default\n";
+            for (double v : laps) ofs << v << "\n";
+            ofs << "SCALARS miner_index double 1\nLOOKUP_TABLE default\n";
+            for (double v : mi_vals) ofs << v << "\n";
+            ofs.close();
+            std::cout << "  Exported " << pts.size() << " critical points to " << fname << "\n";
+        }
+
+        // Save state before MI level set update (for Poisson newly-ossified detection)
+        pre_mi_phi_oss_data = prev_phi_oss_data;
+
+        // Update level set from MI field
         for (int k = 0; k < Kh.nt; ++k) {
             const auto &FK = Sh[k];
             for (int j = 0; j < FK.NbDoF(); ++j) {
                 int iglo = Sh(k, j);
                 if (iglo < 0 || iglo >= nb_sca) continue;
                 R2 P = FK.Pt(j);
-                if (P.y < g_cfg.interface_y) {
-                    phi_oss_data[iglo] = -1.0;
-                    continue;
-                }
-                if (signed_distance_polygon(P, g_polygon) > 0.0) {
-                    phi_oss_data[iglo] = -1.0;
-                    continue;
-                }
-                double dist_outer = std::abs(signed_distance_polygon(P, g_polygon));
-                double t_outer = std::clamp(dist_outer / g_cfg.oss_spline_band, 0.0, 1.0);
-                double inh_outer = t_outer * t_outer * (3.0 - 2.0 * t_outer);
+                if (P.y < g_cfg.interface_y) { phi_oss_data[iglo] = -1.0; continue; }
+                if (signed_distance_polygon(P, g_polygon) > 0.0) { phi_oss_data[iglo] = -1.0; continue; }
 
                 double dist_iface = P.y - g_cfg.interface_y;
                 double t_iface = std::clamp(dist_iface / g_cfg.oss_spline_band, 0.0, 1.0);
                 double inh_iface = t_iface * t_iface * (3.0 - 2.0 * t_iface);
 
-                double inhibition = inh_outer * inh_iface;
-                double phi_new = result.sf_avg.miner[iglo] * inhibition - threshold;
+                double phi_new = result.sf_avg.miner[iglo] * inh_iface - mi_threshold;
                 phi_oss_data[iglo] = std::max(prev_phi_oss_data[iglo], phi_new);
             }
         }
-        int n_ossified = 0;
-        for (int i = 0; i < nb_sca; ++i)
-            if (phi_oss_data[i] >= 0.0) ++n_ossified;
-        std::cout << "  Ossified nodes (current): " << n_ossified << " / " << nb_sca << "\n";
 
-        // ---- Reaction-diffusion on upper SOC domain ----
-        // -Δu + αu = f (consumption in cartilage, decay everywhere)
-        // ∂u/∂n = flux on ossification front (substance invading cartilage)
-        // ∇u·n = 0 on SOC outer & interface_y (free boundary)
+        // Export MI phase
+        std::span<double> prev_span(prev_phi_oss_data);
+        fct_t phi_soc_fh(Sh, prev_span);
+        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
+                         phi_soc_fh, prev_phi_oss_data);
+
+        // Store for Poisson-phase reuse
+        last_U_avg = result.U_avg;
+        last_hd = result.sf_avg.hydrostatic;
+        last_oct = result.sf_avg.oct_shear;
+        last_mi = result.sf_avg.miner;
+        last_mat = mat_data;
+        last_mi_result.all_sols = std::move(result.all_sols);
+
+        } else {
+        // ---- POISSON PHASE: solve Poisson -> threshold -> level set ----
+
         std::vector<double> poisson_data(nb_sca, 0.0);
-        std::span<double> poisson_span(poisson_data);
+        int nb_dof_p = 0;
 
-        if (n_ossified > 0 && iter > 0) {
+        int n_prev_ossified = 0;
+        for (int i = 0; i < nb_sca; ++i)
+            if (prev_phi_oss_data[i] >= 0.0) ++n_prev_ossified;
+
+        if (n_prev_ossified > 0) {
             std::cout << "  Solving Poisson on cartilage domain...\n";
-
-            // Ossification level set and interface
-            std::span<double> oss_p_span(phi_oss_data);
-            fct_t phi_oss_fh(Sh, oss_p_span);
-            InterfaceLevelSet<mesh_t> oss_interface(Kh, phi_oss_fh);
 
             // Upper SOC domain: max(phi_outer, interface_y - y) < 0
             std::vector<double> phi_upper_data(nb_sca);
@@ -1372,22 +1675,32 @@ int main(int argc, char **argv) {
             cutmesh_t Khi_upper(Kh);
             Khi_upper.truncate(upper_interface, 1);
 
+            // Ossification level set from previous iteration
+            // Restrict to Khi_upper: force nodes outside the upper domain
+            // to -1 so zero crossings only exist within Khi_upper
+            std::vector<double> oss_perturbed(prev_phi_oss_data);
+            for (int i = 0; i < nb_sca; ++i) {
+                if (phi_upper_data[i] > 0.0)
+                    oss_perturbed[i] = -1.0;
+                else if (std::abs(oss_perturbed[i]) < 1e-10)
+                    oss_perturbed[i] = -1e-10;
+            }
+            std::span<double> oss_p_span(oss_perturbed);
+            fct_t phi_oss_fh(Sh, oss_p_span);
+            InterfaceLevelSet<mesh_t> oss_interface(Kh, phi_oss_fh);
+
             // Scalar P1 CutFE space
             cutspace_t Wh_p(Khi_upper, Sh);
-            int nb_dof_p = Wh_p.get_nb_dof();
+            nb_dof_p = Wh_p.get_nb_dof();
 
             CutFEM<mesh_t> poisson(Wh_p);
             funtest_t u_p(Wh_p, 1, 0), v_p(Wh_p, 1, 0);
 
-            double penalty_p = 80.0;
-
-            // ∫ ∇u·∇v + α∫ u·v  (reaction-diffusion, α > 0 regularizes pure Neumann)
+            // ∫ ∇u·∇v + α∫ u·v
             poisson.addBilinear(
                 innerProduct(grad(u_p), grad(v_p))
                 + innerProduct(g_cfg.poisson_decay * u_p, v_p),
                 Khi_upper);
-
-            // ∇u·n = 0 on SOC outer & interface_y (natural, no terms needed)
 
             // Flux from ossification front: ∫ flux·v ds
             fct_t flux_fh(Sh, [](R2 P, int i, int dom) -> double {
@@ -1397,18 +1710,53 @@ int main(int argc, char **argv) {
                 innerProduct(flux_fh.expr(), v_p),
                 oss_interface);
 
-            // Source term: ∫ f·v in cartilage (phi_oss < 0, above interface_y)
+            // Source term: ∫ f·v in cartilage (phi_oss < 0)
             fct_t source_fh(Sh, [](R2 P, int i, int dom) -> double {
                 return g_cfg.poisson_source;
             });
             std::vector<double> cart_mask_vec(nb_sca, 0.0);
             for (int i = 0; i < nb_sca; ++i)
-                if (phi_oss_data[i] < 0.0) cart_mask_vec[i] = 1.0;
+                if (prev_phi_oss_data[i] < 0.0) cart_mask_vec[i] = 1.0;
             std::span<double> cart_mask_span(cart_mask_vec);
             fct_t oss_mask_fh(Sh, cart_mask_span);
             poisson.addLinear(
                 innerProduct(oss_mask_fh.expr() * source_fh.expr(), v_p),
                 Khi_upper);
+
+            // Dirichlet u=0 on domain boundaries via Nitsche
+            // upper_interface is the combined boundary of Khi_upper (outer + iface),
+            // so all its cut elements are guaranteed to be in Khi_upper.
+            if (g_cfg.poisson_dirichlet_outer && g_cfg.poisson_dirichlet_iface) {
+                // Dirichlet on entire boundary
+                poisson.addBilinear(
+                    -innerProduct(grad(u_p)*n, v_p)
+                    -innerProduct(u_p, grad(v_p)*n)
+                    +innerProduct((20.0/h) * u_p, v_p),
+                    upper_interface);
+            } else if (g_cfg.poisson_dirichlet_outer) {
+                // Restrict outer level set: force positive below interface_y
+                // to avoid zero crossings outside Khi_upper
+                std::vector<double> phi_outer_restr(phi_outer_data);
+                for (int i = 0; i < nb_sca; ++i)
+                    if (phi_iface_data[i] < 0.0) phi_outer_restr[i] = std::max(phi_outer_restr[i], 1.0);
+                std::span<double> phi_o_span(phi_outer_restr);
+                fct_t phi_o_fh(Sh, phi_o_span);
+                InterfaceLevelSet<mesh_t> outer_interface(Kh, phi_o_fh);
+                poisson.addBilinear(
+                    -innerProduct(grad(u_p)*n, v_p)
+                    -innerProduct(u_p, grad(v_p)*n)
+                    +innerProduct((20.0/h) * u_p, v_p),
+                    outer_interface);
+            } else if (g_cfg.poisson_dirichlet_iface) {
+                // Use upper_interface (applies on full boundary);
+                // the outer part becomes natural Neumann by not penalizing it
+                // TODO: implement selective masking for iface-only Dirichlet
+                poisson.addBilinear(
+                    -innerProduct(grad(u_p)*n, v_p)
+                    -innerProduct(u_p, grad(v_p)*n)
+                    +innerProduct((20.0/h) * u_p, v_p),
+                    upper_interface);
+            }
 
             // Ghost-penalty stabilization
             poisson.addFaceStabilization(
@@ -1418,7 +1766,7 @@ int main(int argc, char **argv) {
 
             poisson.solve("umfpack");
 
-            // Project CutFE solution onto Sh (full mesh) for unified export
+            // Project CutFE solution onto Sh
             std::span<double> poisson_sol(poisson.rhs_.data(), nb_dof_p);
             fct_t poisson_cut(Wh_p, poisson_sol);
 
@@ -1436,22 +1784,58 @@ int main(int argc, char **argv) {
             std::cout << "  Poisson solved, DOFs=" << nb_dof_p << "\n";
         }
 
-        // Build poisson FE function on Sh AFTER data is populated (or zeros for iter 0)
+        // Poisson threshold: minimum Poisson value on newly ossified boundary
+        double poisson_thresh = compute_poisson_threshold(
+            poisson_data, prev_phi_oss_data, pre_mi_phi_oss_data, nb_sca);
+        std::cout << "  Threshold (Poisson) = " << poisson_thresh << "\n";
+        std::cout << "  DOFs (Poisson) = " << nb_dof_p << "\n";
+
+        // Update level set from Poisson field
+        for (int k = 0; k < Kh.nt; ++k) {
+            const auto &FK = Sh[k];
+            for (int j = 0; j < FK.NbDoF(); ++j) {
+                int iglo = Sh(k, j);
+                if (iglo < 0 || iglo >= nb_sca) continue;
+                R2 P = FK.Pt(j);
+                if (P.y < g_cfg.interface_y) { phi_oss_data[iglo] = -1.0; continue; }
+                if (signed_distance_polygon(P, g_polygon) > 0.0) { phi_oss_data[iglo] = -1.0; continue; }
+
+                double phi_new = poisson_data[iglo] - poisson_thresh;
+                phi_oss_data[iglo] = std::max(prev_phi_oss_data[iglo], phi_new);
+            }
+        }
+
+        // Export using last MI fields + new Poisson
+        std::span<double> poisson_span(poisson_data);
         fct_t poisson_sh(Sh, poisson_span);
-        fct_t *poisson_fh_ptr = &poisson_sh;
 
-        // phi_soc_fh for export: use prev_phi_oss_data (the ossification that was
-        // applied as material for this solve), not the newly computed one
-        std::span<double> prev_phi_oss_span(prev_phi_oss_data);
-        fct_t phi_soc_fh(Sh, prev_phi_oss_span);
+        std::span<double> u_span(last_U_avg);
+        fct_t uh_avg(Wh, u_span);
+        std::span<double> hd_span(last_hd);
+        fct_t hd_fh(Sh, hd_span);
+        std::span<double> oct_span(last_oct);
+        fct_t oct_fh(Sh, oct_span);
+        std::span<double> mi_span(last_mi);
+        fct_t mi_fh(Sh, mi_span);
+        std::span<double> mat_span(last_mat);
+        fct_t mat_fh(Sh, mat_span);
 
-        // Export VTK (shows the state used in the current solve + Poisson from new front)
-        export_iteration(iter, result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
-                         phi_soc_fh, prev_phi_oss_data, poisson_fh_ptr);
+        std::span<double> prev_span(prev_phi_oss_data);
+        fct_t phi_soc_fh(Sh, prev_span);
 
-        // Store ossification for next iteration material update
+        RunResult empty_result;
+        export_iteration(iter, empty_result, uh_avg, hd_fh, oct_fh, mi_fh, mat_fh,
+                         phi_soc_fh, prev_phi_oss_data, &poisson_sh);
+
+        } // end phase branch
+
+        // Common logging
+        int n_ossified = 0;
+        for (int i = 0; i < nb_sca; ++i)
+            if (phi_oss_data[i] >= 0.0) ++n_ossified;
+        std::cout << "  Ossified nodes: " << n_ossified << " / " << nb_sca << "\n";
+
         prev_phi_oss_data = phi_oss_data;
-
         std::cout << "  Iteration " << iter << " done.\n";
     }
 

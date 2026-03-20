@@ -1,0 +1,22 @@
+❯ were getting there, however, the material update in @growth_iterative_cutfem.cpp is  │=== Iteration 1 ===
+still based on mi, not in the newly calculated poisson. Remember, each it has steps    │Using UMFPACK
+                                                                                       │    Step 1/5 done.
+Lets reframe it, so we can understand better. Lets separate poisson and mi in          │Using UMFPACK
+different steps.                                                                       │    Step 2/5 done.
+                                                                                       │Using UMFPACK
+mi step, takes the provided level set, cuts and do poisson calculation for next step   │    Step 3/5 done.
+poisson step, takes the provided level set, cuts and do mechanical for the next step   │Using UMFPACK
+                                                                                       │    Step 4/5 done.
+step 0, mi, initial seed                                                               │Using UMFPACK
+step 1, mi, first mech expansion                                                       │    Step 5/5 done.
+step 2, poisson (to homogenize last)                                                   │  Ossified nodes (current): 144 / 48441
+step 3, mi, with the homogenized poisson                                               │  Solving Poisson on cartilage domain...
+step 4, poisson,                                                                       │Using UMFPACK
+                                                                                       │  Poisson solved, DOFs=17911
+and so on                                                                              │  MI local maxima (closest to front):
+                                                                                       │  Poisson isocontour cut: threshold=4.53723, ossified=254
+mi step threshold selection, maxima around the ossification center and choose          │  Iteration 1 done.
+accordingly to the neighor values                                                      │
+poisson step threshold selection, minimum poisson value in the ossification interface. │=== Iteration 2 ===
+                                                                                       │Using UMFPACK
+thats it, then, lets make 10 steps, edit the test file.  

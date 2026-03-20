@@ -1,5 +1,5 @@
 {
-  "n_iterations": 25,
+  "n_iterations": 30,
   "export_cartilage": false,
   "export_active": false,
   "export_trimmed": true,

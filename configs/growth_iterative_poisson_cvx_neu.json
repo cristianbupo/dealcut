@@ -21,8 +21,8 @@
   "poisson_source": 0.0,
   "poisson_flux": 1.0,
   "poisson_decay": 0.1,
-  "poisson_dirichlet_outer": true,
-  "poisson_dirichlet_iface": true,
-  "output_dir": "output/growth_iterative_poisson_test",
-  "gmsh_model_name": "growth_iterative_poisson_test"
+  "poisson_dirichlet_outer": false,
+  "poisson_dirichlet_iface": false,
+  "output_dir": "output/growth_iterative_poisson_cvx_neu",
+  "gmsh_model_name": "growth_iterative_poisson_cvx_neu"
 }
