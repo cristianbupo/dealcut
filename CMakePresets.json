@@ -17,5 +17,25 @@
         "CMAKE_CXX_COMPILER": "mpicxx"
       }
     }
+  ],
+  "buildPresets": [
+    {
+      "name": "square_dealii",
+      "displayName": "Build square_dealii",
+      "configurePreset": "mpi-release",
+      "targets": ["square_dealii"]
+    },
+    {
+      "name": "square_cutlib",
+      "displayName": "Build square_cutlib",
+      "configurePreset": "mpi-release",
+      "targets": ["square_cutlib"]
+    },
+    {
+      "name": "square_both",
+      "displayName": "Build square_dealii + square_cutlib",
+      "configurePreset": "mpi-release",
+      "targets": ["square_dealii", "square_cutlib"]
+    }
   ]
 }

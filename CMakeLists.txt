@@ -16,6 +16,10 @@ if(${deal.II_FOUND})
     deal_ii_initialize_cached_variables()
     add_executable(step-85 step-85.cc)
     deal_ii_setup_target(step-85)
+
+    # square_dealii: bimaterial elasticity on unit square (deal.II only, no VTK/Gmsh)
+    add_executable(square_dealii square_dealii.cc)
+    deal_ii_setup_target(square_dealii)
   endif()
 else()
   message(STATUS "deal.II not found — skipping step-85")
@@ -109,6 +113,28 @@ if(EXISTS "${CUTFEM_DIR}/cpp/cutfem.hpp" AND EXISTS "${CUTFEM_BUILD_DIR}/lib")
   )
   target_link_directories(step85_cutfem PRIVATE ${CUTFEM_BUILD_DIR}/lib)
   target_link_libraries(step85_cutfem PRIVATE parallel common FESpace solver problem)
+
+  # square_cutlib: bimaterial elasticity on unit square (CutFEM-Library, no Gmsh)
+  add_executable(square_cutlib square_cutlib.cpp)
+  set_target_properties(square_cutlib PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+  target_include_directories(square_cutlib PRIVATE
+    ${CUTFEM_DIR}
+    ${CUTFEM_DIR}/cpp
+    ${CUTFEM_DIR}/cpp/problem
+    ${CUTFEM_DIR}/cpp/FESpace
+    ${CUTFEM_DIR}/cpp/common
+    ${CUTFEM_DIR}/cpp/solver
+    ${CUTFEM_DIR}/cpp/parallel
+    ${CUTFEM_DIR}/cpp/num
+    ${CUTFEM_DIR}/cpp/algoim
+    ${CUTFEM_DIR}/cpp/concept
+    ${CUTFEM_BUILD_DIR}
+  )
+  target_link_directories(square_cutlib PRIVATE ${CUTFEM_BUILD_DIR}/lib)
+  target_link_libraries(square_cutlib PRIVATE parallel common FESpace solver problem)
 
   # SOC_cutfem: SOC elasticity problem reimplemented with CutFEM-Library + Gmsh
   find_path(GMSH_INCLUDE_DIR gmsh.h HINTS /usr/include)
