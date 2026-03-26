@@ -1086,6 +1086,7 @@ int main(int argc, char **argv) {
         std::vector<double> U_avg;
         std::vector<std::vector<double>> all_sols;
         StressFields sf_avg;
+        std::vector<StressFields> all_stress_fields;
     };
 
     auto run_elasticity = [&](const fct_t &two_mu_fh, const fct_t &lambda_fh) -> RunResult
@@ -1094,6 +1095,7 @@ int main(int argc, char **argv) {
         std::vector<double> U_sum(nb_dof, 0.0);
         std::vector<double> hd_sum(nb_sca, 0.0), oct_sum(nb_sca, 0.0), mi_sum(nb_sca, 0.0);
         std::vector<std::vector<double>> all_sols;
+        std::vector<StressFields> all_sf;
 
         for (unsigned int sidx = 0; sidx < steps.size(); ++sidx) {
             g_step_u_center = steps[sidx].u_center;
@@ -1136,6 +1138,7 @@ int main(int argc, char **argv) {
                     oct_sum[i] += sf_step.oct_shear[i];
                     mi_sum[i]  += sf_step.miner[i];
                 }
+                all_sf.push_back(std::move(sf_step));
             }
 
             all_sols.push_back(std::move(sol));
@@ -1156,6 +1159,7 @@ int main(int argc, char **argv) {
         res.sf_avg.hydrostatic = std::move(hd_sum);
         res.sf_avg.oct_shear   = std::move(oct_sum);
         res.sf_avg.miner       = std::move(mi_sum);
+        res.all_stress_fields = std::move(all_sf);
         return res;
     };
 
@@ -1182,6 +1186,20 @@ int main(int argc, char **argv) {
             fct_t uh(Wh, sp);
             Paraview<mesh_t> w(Khi, g_cfg.output_dir + "/" + iter_prefix + "_step_" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
+            if (sidx < result.all_stress_fields.size()) {
+                std::span<double> hd_sp(const_cast<double*>(result.all_stress_fields[sidx].hydrostatic.data()),
+                                        result.all_stress_fields[sidx].hydrostatic.size());
+                fct_t hd_step(Sh, hd_sp);
+                w.add(hd_step, "hydrostatic", 0, 1);
+                std::span<double> oct_sp(const_cast<double*>(result.all_stress_fields[sidx].oct_shear.data()),
+                                         result.all_stress_fields[sidx].oct_shear.size());
+                fct_t oct_step(Sh, oct_sp);
+                w.add(oct_step, "oct_shear", 0, 1);
+                std::span<double> mi_sp(const_cast<double*>(result.all_stress_fields[sidx].miner.data()),
+                                        result.all_stress_fields[sidx].miner.size());
+                fct_t mi_step(Sh, mi_sp);
+                w.add(mi_step, "miner_index", 0, 1);
+            }
             w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_soc_fh, "phi_soc", 0, 1);
