@@ -239,6 +239,12 @@ vtk_postprocess_add_true_celldata(
     throw std::runtime_error("VTK: writer failed for " + out_vtu);
 }
 
+enum class RunMode
+{
+  export_mi  = 0,
+  import_mi  = 1
+};
+
 namespace SOC
 {
   using namespace dealii;
@@ -451,7 +457,9 @@ namespace SOC
 class ImmersedElasticity
   {
   public:
-    ImmersedElasticity();
+    ImmersedElasticity(RunMode mode,
+                       unsigned int iter_id,
+                       unsigned int import_id);
     void run();
 
   private:
@@ -542,18 +550,12 @@ class ImmersedElasticity
     std::vector<StepDef> build_default_steps() const;
 
   private:
-    enum class RunMode
-    {
-      export_mi  = 0,
-      import_mi  = 1
-    };
-
     // -----------------------------
     // user knobs for chained runs
     // -----------------------------
-    const RunMode     run_mode            = RunMode::import_mi;
-    const unsigned int iteration_id       = 1; // current output suffix: _0, _1, ...
-    const unsigned int import_iteration_id = 0; // used only when run_mode=import_mi
+    RunMode     run_mode            = RunMode::import_mi;
+    unsigned int iteration_id       = 1; // current output suffix: _0, _1, ...
+    unsigned int import_iteration_id = 0; // used only when run_mode=import_mi
 
     // GEOMETRY SCALE (you used 2.2)
     const double s = 1.0;
@@ -709,8 +711,14 @@ class ImmersedElasticity
   };
 
   template <int dim>
-  ImmersedElasticity<dim>::ImmersedElasticity()
-    : fe_level_set(phi_degree)
+  ImmersedElasticity<dim>::ImmersedElasticity(
+    RunMode mode,
+    unsigned int iter_id,
+    unsigned int import_id)
+    : run_mode(mode)
+    , iteration_id(iter_id)
+    , import_iteration_id(import_id)
+    , fe_level_set(phi_degree)
     , level_set_dh(triangulation)
     , dof_handler_vec(triangulation)
     , dof_handler_sca(triangulation)
@@ -722,8 +730,8 @@ class ImmersedElasticity
   void ImmersedElasticity<dim>::make_background_grid()
   {
     std::vector<unsigned int> nsub(dim);
-    nsub[0] = 60;
-    nsub[1] = 60;
+    nsub[0] = 200;
+    nsub[1] = 200;
 
     GridGenerator::subdivided_hyper_rectangle(triangulation, nsub, bg_p1, bg_p2, false);
 
@@ -2573,22 +2581,39 @@ class ImmersedElasticity
 
 } // namespace SOC
 
-int main()
+int main(int argc, char **argv)
 {
-  try
-    {
-      SOC::ImmersedElasticity<2> prob;
-      prob.run();
-    }
-  catch (std::exception &e)
-    {
-      std::cerr << "Exception: " << e.what() << "\n";
+  constexpr int dim = 2;
+  
+  RunMode run_mode = RunMode::import_mi;
+  unsigned int iteration_id = 1;
+  unsigned int import_iteration_id = 0;
+
+  if (argc > 1) {
+    const std::string mode_arg = argv[1];
+    if (mode_arg == "export_mi") {
+      run_mode = RunMode::export_mi;
+      iteration_id = 0;
+    } else if (mode_arg == "import_mi") {
+      run_mode = RunMode::import_mi;
+      iteration_id = 1;
+      if (argc > 2) {
+        import_iteration_id = std::stoi(argv[2]);
+      }
+    } else {
+      std::cerr << "Usage: " << argv[0] << " [export_mi|import_mi] [import_iteration_id]\n";
+      std::cerr << "  export_mi              : export mi field (first run)\n";
+      std::cerr << "  import_mi [iter_id]    : import mi from iteration iter_id (default: 0)\n";
       return 1;
     }
-  catch (...)
-    {
-      std::cerr << "Unknown exception.\n";
-      return 1;
-    }
+  }
+
+  std::cout << "Run mode: " << (run_mode == RunMode::export_mi ? "export_mi" : "import_mi")
+            << ", iteration_id: " << iteration_id
+            << ", import_iteration_id: " << import_iteration_id << "\n";
+
+  SOC::ImmersedElasticity<dim> elasticity(run_mode, iteration_id, import_iteration_id);
+  elasticity.run();
+
   return 0;
 }
