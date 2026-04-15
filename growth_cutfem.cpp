@@ -870,6 +870,7 @@ int main(int argc, char **argv) {
     struct RunResult {
         std::vector<double> U_avg;
         std::vector<std::vector<double>> all_sols;
+        std::vector<StressFields> all_sf;
         StressFields sf_avg; // averaged stress fields (per-step MI → average)
     };
 
@@ -879,6 +880,7 @@ int main(int argc, char **argv) {
         std::vector<double> U_sum(nb_dof, 0.0);
         std::vector<double> hd_sum(nb_sca, 0.0), oct_sum(nb_sca, 0.0), mi_sum(nb_sca, 0.0);
         std::vector<std::vector<double>> all_sols;
+        std::vector<StressFields> all_sf;
 
         for (unsigned int sidx = 0; sidx < steps.size(); ++sidx) {
             g_step_u_center = steps[sidx].u_center;
@@ -921,6 +923,7 @@ int main(int argc, char **argv) {
                     oct_sum[i] += sf_step.oct_shear[i];
                     mi_sum[i]  += sf_step.miner[i];
                 }
+                all_sf.push_back(std::move(sf_step));
             }
 
             all_sols.push_back(std::move(sol));
@@ -939,6 +942,7 @@ int main(int argc, char **argv) {
         RunResult res;
         res.U_avg = std::move(U_sum);
         res.all_sols = std::move(all_sols);
+        res.all_sf = std::move(all_sf);
         res.sf_avg.hydrostatic = std::move(hd_sum);
         res.sf_avg.oct_shear   = std::move(oct_sum);
         res.sf_avg.miner       = std::move(mi_sum);
@@ -948,7 +952,8 @@ int main(int argc, char **argv) {
     // ============================================================
     // EXPORT MODE
     // ============================================================
-    if (run_mode == RunMode::export_mi) {
+    // if (run_mode == RunMode::export_mi) {
+    {
         std::cout << "\n=== EXPORT MODE (Step 1) ===\n";
 
         fct_t two_mu_fh = make_base_two_mu();
@@ -956,37 +961,26 @@ int main(int argc, char **argv) {
         auto result = run_elasticity(two_mu_fh, lambda_fh);
 
         // Level set FE functions: SOC boundary + bone/cartilage interface
-        std::vector<double> phi_soc_data(nb_sca), phi_iface_data(nb_sca);
+        std::vector<double> phi_outer_data(nb_sca), phi_iface_data(nb_sca);
         for (int k = 0; k < Kh.nt; ++k) {
             const auto &FK = Sh[k];
             for (int j = 0; j < FK.NbDoF(); ++j) {
                 int iglo = Sh(k, j);
                 if (iglo < 0 || iglo >= nb_sca) continue;
                 R2 P = FK.Pt(j);
-                phi_soc_data[iglo]   = signed_distance_polygon(P, g_polygon);
+                phi_outer_data[iglo]   = signed_distance_polygon(P, g_polygon);
                 phi_iface_data[iglo] = P.y - interfaceY;
             }
         }
-        std::span<double> phi_soc_span(phi_soc_data);
-        fct_t phi_soc_fh(Sh, phi_soc_span);
+        std::span<double> phi_outer_span(phi_outer_data);
+        fct_t phi_outer_fh(Sh, phi_outer_span);
         std::span<double> phi_iface_span(phi_iface_data);
         fct_t phi_iface_fh(Sh, phi_iface_span);
 
         // Zero phi_soc (no ossification in step 0)
-        std::vector<double> phi_oss_data(nb_sca, 0.0);
-        std::span<double> phi_oss_span(phi_oss_data);
-        fct_t phi_oss_fh(Sh, phi_oss_span);
-
-        // Write per-step outputs (trimmed)
-        for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
-            std::span<double> sp(result.all_sols[sidx]);
-            fct_t uh(Wh, sp);
-            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_0_step_" + std::to_string(sidx+1) + ".vtk");
-            w.add(uh, "displacement", 0, 2);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
-            w.add(phi_iface_fh, "phi_interface", 0, 1);
-            w.add(phi_oss_fh, "phi_soc", 0, 1);
-        }
+        std::vector<double> phi_soc_data(nb_sca, 0.0);
+        std::span<double> phi_soc_span(phi_soc_data);
+        fct_t phi_soc_fh(Sh, phi_soc_span);
 
         g_mi_avg = result.sf_avg.miner;
         g_mi_threshold = find_threshold(g_mi_avg, Sh, Kh);
@@ -1014,6 +1008,28 @@ int main(int argc, char **argv) {
         std::span<double> mat_span(mat_data);
         fct_t mat_fh(Sh, mat_span);
 
+        // Write per-step outputs (trimmed)
+        for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
+            std::span<double> sp(result.all_sols[sidx]);
+            fct_t uh(Wh, sp);
+
+            std::span<double> hd_step_span(result.all_sf[sidx].hydrostatic);
+            fct_t hd_step(Sh, hd_step_span);
+            std::span<double> oct_step_span(result.all_sf[sidx].oct_shear);
+            fct_t oct_step(Sh, oct_step_span);
+            std::span<double> mi_step_span(result.all_sf[sidx].miner);
+            fct_t mi_step(Sh, mi_step_span);
+
+            Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_0_step_" + std::to_string(sidx+1) + ".vtk");
+            w.add(uh, "displacement", 0, 2);
+            w.add(hd_step, "hydrostatic", 0, 1);
+            w.add(oct_step, "oct_shear", 0, 1);
+            w.add(mi_step, "miner_index", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
+            w.add(phi_iface_fh, "phi_interface", 0, 1);
+            w.add(phi_soc_fh, "phi_soc", 0, 1);
+        }
+
         // Trimmed (cut polygons at SOC boundary)
         {
             Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_fields_0.vtk");
@@ -1022,9 +1038,9 @@ int main(int argc, char **argv) {
             w.add(oct_fh, "oct_shear", 0, 1);
             w.add(mi_fh, "miner_index", 0, 1);
             w.add(mat_fh, "material", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
-            w.add(phi_oss_fh, "phi_soc", 0, 1);
+            w.add(phi_soc_fh, "phi_soc", 0, 1);
         }
 
         // Active elements (full quads)
@@ -1036,9 +1052,9 @@ int main(int argc, char **argv) {
             w.add(oct_fh, "oct_shear", 0, 1);
             w.add(mi_fh, "miner_index", 0, 1);
             w.add(mat_fh, "material", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
-            w.add(phi_oss_fh, "phi_soc", 0, 1);
+            w.add(phi_soc_fh, "phi_soc", 0, 1);
         }
 
         // Trimmed both sides (SOC boundary + bone/cartilage interface)
@@ -1048,8 +1064,8 @@ int main(int argc, char **argv) {
              [](const R2& P, int) { return P.y - interfaceY; }},
             {{&hd_fh, "hydrostatic"}, {&oct_fh, "oct_shear"},
              {&mi_fh, "miner_index"},
-             {&phi_soc_fh, "phi_outer"}, {&phi_iface_fh, "phi_interface"},
-             {&phi_oss_fh, "phi_soc"}},
+             {&phi_outer_fh, "phi_outer"}, {&phi_iface_fh, "phi_interface"},
+             {&phi_soc_fh, "phi_soc"}},
             {{&mat_fh, "material"}},
             {{[](const R2& P, int) -> double { return P.y < interfaceY ? 0.0 : 1.0; },
               "material_sharp"}},
@@ -1081,9 +1097,9 @@ int main(int argc, char **argv) {
             w.add(oct_fh, "oct_shear", 0, 1);
             w.add(mi_fh, "miner_index", 0, 1);
             w.add(mat_fh, "material", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
-            w.add(phi_oss_fh, "phi_soc", 0, 1);
+            w.add(phi_soc_fh, "phi_soc", 0, 1);
         }
 
         save_restart(g_mi_avg, g_mi_threshold, iteration_id);
@@ -1092,7 +1108,8 @@ int main(int argc, char **argv) {
     // ============================================================
     // IMPORT MODE
     // ============================================================
-    else {
+    // else {
+    {
         std::cout << "\n=== IMPORT MODE (Step 2) ===\n";
 
         // Load Miner index + threshold from step 1
@@ -1103,7 +1120,7 @@ int main(int argc, char **argv) {
         // effective MI is scaled down so ossification cannot nucleate there.
         //   inhibition = smoothstep(dist / oss_spline_band)
         //   phi_oss    = MI * inhibition - threshold
-        std::vector<double> phi_oss_data(nb_sca);
+        std::vector<double> phi_soc_data(nb_sca);
         std::vector<double> inhibition_data(nb_sca, 1.0);
         for (int k = 0; k < Kh.nt; ++k) {
             const auto &FK = Sh[k];
@@ -1115,12 +1132,12 @@ int main(int argc, char **argv) {
                 double t = std::clamp(dist / oss_spline_band, 0.0, 1.0);
                 double inhibition = t * t * (3.0 - 2.0 * t); // smoothstep
                 inhibition_data[iglo] = inhibition;
-                phi_oss_data[iglo] = g_mi_avg[iglo] * inhibition - g_mi_threshold;
+                phi_soc_data[iglo] = g_mi_avg[iglo] * inhibition - g_mi_threshold;
             }
         }
 
-        std::span<double> phi_oss_span(phi_oss_data);
-        fct_t phi_oss(Sh, phi_oss_span);
+        std::span<double> phi_soc_span(phi_soc_data);
+        fct_t phi_oss(Sh, phi_soc_span);
 
         // Build material coefficients using φ_oss sign:
         // bone (y < interface): always bone
@@ -1146,7 +1163,7 @@ int main(int argc, char **argv) {
                 for (int j = 0; j < FK.NbDoF(); ++j) {
                     int iglo = Sh(k, j);
                     if (iglo < 0 || iglo >= nb_sca) continue;
-                    if (phi_oss_data[iglo] >= 0.0 && FK.Pt(j).y >= interfaceY) {
+                    if (phi_soc_data[iglo] >= 0.0 && FK.Pt(j).y >= interfaceY) {
                         tmu_v[iglo] = 2.0 * mu_oss;
                         lam_v[iglo] = lambda_oss;
                         ++n_ossified;
@@ -1168,25 +1185,25 @@ int main(int argc, char **argv) {
                 if (iglo < 0 || iglo >= nb_sca) continue;
                 R2 P = FK.Pt(j);
                 if (P.y < interfaceY) mat_data[iglo] = 0.0;
-                else if (phi_oss_data[iglo] >= 0.0) mat_data[iglo] = 2.0;
+                else if (phi_soc_data[iglo] >= 0.0) mat_data[iglo] = 2.0;
                 else mat_data[iglo] = 1.0;
             }
         }
 
         // Level set FE functions: SOC boundary + bone/cartilage interface
-        std::vector<double> phi_soc_data(nb_sca), phi_iface_data(nb_sca);
+        std::vector<double> phi_outer_data(nb_sca), phi_iface_data(nb_sca);
         for (int k = 0; k < Kh.nt; ++k) {
             const auto &FK = Sh[k];
             for (int j = 0; j < FK.NbDoF(); ++j) {
                 int iglo = Sh(k, j);
                 if (iglo < 0 || iglo >= nb_sca) continue;
                 R2 P = FK.Pt(j);
-                phi_soc_data[iglo]   = signed_distance_polygon(P, g_polygon);
+                phi_outer_data[iglo]   = signed_distance_polygon(P, g_polygon);
                 phi_iface_data[iglo] = P.y - interfaceY;
             }
         }
-        std::span<double> phi_soc_span(phi_soc_data);
-        fct_t phi_soc_fh(Sh, phi_soc_span);
+        std::span<double> phi_outer_span(phi_outer_data);
+        fct_t phi_outer_fh(Sh, phi_outer_span);
         std::span<double> phi_iface_span(phi_iface_data);
         fct_t phi_iface_fh(Sh, phi_iface_span);
 
@@ -1194,9 +1211,20 @@ int main(int argc, char **argv) {
         for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
             std::span<double> sp(result.all_sols[sidx]);
             fct_t uh(Wh, sp);
+
+            std::span<double> hd_step_span(result.all_sf[sidx].hydrostatic);
+            fct_t hd_step(Sh, hd_step_span);
+            std::span<double> oct_step_span(result.all_sf[sidx].oct_shear);
+            fct_t oct_step(Sh, oct_step_span);
+            std::span<double> mi_step_span(result.all_sf[sidx].miner);
+            fct_t mi_step(Sh, mi_step_span);
+
             Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_1_step_" + std::to_string(sidx+1) + ".vtk");
             w.add(uh, "displacement", 0, 2);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(hd_step, "hydrostatic", 0, 1);
+            w.add(oct_step, "oct_shear", 0, 1);
+            w.add(mi_step, "miner_index", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
             w.add(phi_oss, "phi_soc", 0, 1);
         }
@@ -1225,7 +1253,7 @@ int main(int argc, char **argv) {
             w.add(phi_oss, "phi_soc", 0, 1);
             w.add(mat_fh, "material", 0, 1);
             w.add(inhib_fh, "spline_inhibition", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
         }
 
@@ -1240,7 +1268,7 @@ int main(int argc, char **argv) {
             w.add(phi_oss, "phi_soc", 0, 1);
             w.add(mat_fh, "material", 0, 1);
             w.add(inhib_fh, "spline_inhibition", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
         }
 
@@ -1253,7 +1281,7 @@ int main(int argc, char **argv) {
             {{&hd_fh, "hydrostatic"}, {&oct_fh, "oct_shear"},
              {&mi_fh, "miner_index"},
              {&phi_oss, "phi_soc"}, {&inhib_fh, "spline_inhibition"},
-             {&phi_soc_fh, "phi_outer"}, {&phi_iface_fh, "phi_interface"}},
+             {&phi_outer_fh, "phi_outer"}, {&phi_iface_fh, "phi_interface"}},
             {{&mat_fh, "material"}},
             {{[&phi_oss](const R2& P, int kb) -> double {
                   if (P.y < interfaceY) return 0.0;
@@ -1273,7 +1301,7 @@ int main(int argc, char **argv) {
                     R2 P = FK.Pt(j);
                     double phi_soc = signed_distance_polygon(P, g_polygon);
                     double phi_y   = interfaceY - P.y;
-                    double phi_o   = phi_oss_data[iglo];
+                    double phi_o   = phi_soc_data[iglo];
                     phi_cart_data[iglo] = std::max({phi_soc, phi_y, phi_o});
                 }
             }
@@ -1290,7 +1318,7 @@ int main(int argc, char **argv) {
             w.add(mi_fh, "miner_index", 0, 1);
             w.add(phi_oss, "phi_soc", 0, 1);
             w.add(mat_fh, "material", 0, 1);
-            w.add(phi_soc_fh, "phi_outer", 0, 1);
+            w.add(phi_outer_fh, "phi_outer", 0, 1);
             w.add(phi_iface_fh, "phi_interface", 0, 1);
         }
 
