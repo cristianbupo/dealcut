@@ -81,6 +81,7 @@ static constexpr double lambda_oss = E_oss * nu_oss / ((1.0 + nu_oss) * (1.0 - 2
 static constexpr double oss_height_target = 0.1; // approximate target height of ossified region
 static constexpr double kMi = 0.5;
 static constexpr double oss_spline_band = 0.3;    // distance over which ossification is inhibited near spline
+static constexpr double growth_plate_width = 0.3; // lower cartilage band excluded from Poisson domain
 
 // ============================================================
 // Load
@@ -213,14 +214,15 @@ static void build_soc_geometry() {
 // ============================================================
 // Load steps
 // ============================================================
-static std::vector<StepDef> build_default_steps() {
+static std::vector<StepDef> build_default_steps(int n = 5) {
   double u0 = g_top_u.front(), u1 = g_top_u.back(), ur = u1-u0;
   double uc = u0 + load_center_u_frac*ur, du = load_du_frac*ur;
-  std::vector<StepDef> steps = {
-    {uc+2*du, du, 0.50*load_p_peak}, {uc+du, du, 0.75*load_p_peak},
-    {uc,      du, 1.00*load_p_peak}, {uc-du, du, 0.75*load_p_peak},
-    {uc-2*du, du, 0.50*load_p_peak}
-  };
+  std::vector<StepDef> steps(n);
+  double half = (n - 1) / 2.0;
+  for (int i = 0; i < n; ++i) {
+    double s = (half > 0) ? (half - i) / half : 0.0;  // +1 at edges, 0 at center
+    steps[i] = {uc + s * 2.0 * du, du, (1.0 - 0.5 * std::abs(s)) * load_p_peak};
+  }
   for (auto &st : steps) st.u_center = std::clamp(st.u_center, u0, u1);
   return steps;
 }
@@ -293,6 +295,7 @@ struct ElementInterfaceLS {
 // ============================================================
 struct StressFields {
   std::vector<double> hydrostatic, oct_shear, miner;
+  std::vector<double> exx, eyy, exy; // strain components
 };
 
 // Compute stress fields at nodes using Algoim quadrature on cut elements.
@@ -306,6 +309,7 @@ static StressFields compute_stress_fields(
   static constexpr int algoim_order = 3;
 
   std::vector<double> hd_sum(nb_sca_dof, 0.0), oct_sum(nb_sca_dof, 0.0), mi_sum(nb_sca_dof, 0.0);
+  std::vector<double> exx_sum(nb_sca_dof, 0.0), eyy_sum(nb_sca_dof, 0.0), exy_sum(nb_sca_dof, 0.0);
   std::vector<double> wt_sum(nb_sca_dof, 0.0);
 
   int nact = Khi.get_nb_element();
@@ -352,6 +356,9 @@ static StressFields compute_stress_fields(
         hd_sum[iglo]  += inv.hydrostatic * elem_area;
         oct_sum[iglo] += inv.oct_shear   * elem_area;
         mi_sum[iglo]  += inv.miner       * elem_area;
+        exx_sum[iglo] += exx * elem_area;
+        eyy_sum[iglo] += eyy * elem_area;
+        exy_sum[iglo] += exy * elem_area;
         wt_sum[iglo]  += elem_area;
       }
     } else {
@@ -377,8 +384,9 @@ static StressFields compute_stress_fields(
 
       if (q.nodes.empty()) continue;
 
-      // Accumulate area-weighted stress over cartilage quadrature points
+      // Accumulate area-weighted stress/strain over cartilage quadrature points
       double hd_acc = 0, oct_acc = 0, mi_acc = 0, w_acc = 0;
+      double exx_acc = 0, eyy_acc = 0, exy_acc = 0;
       for (size_t iq = 0; iq < q.nodes.size(); ++iq) {
         R2 mip(q.nodes[iq].x(0), q.nodes[iq].x(1));
         double w = q.nodes[iq].w;
@@ -395,6 +403,9 @@ static StressFields compute_stress_fields(
         hd_acc  += inv.hydrostatic * w;
         oct_acc += inv.oct_shear   * w;
         mi_acc  += inv.miner       * w;
+        exx_acc += exx * w;
+        eyy_acc += eyy * w;
+        exy_acc += exy * w;
         w_acc   += w;
       }
 
@@ -408,6 +419,9 @@ static StressFields compute_stress_fields(
         hd_sum[iglo]  += hd_acc;
         oct_sum[iglo] += oct_acc;
         mi_sum[iglo]  += mi_acc;
+        exx_sum[iglo] += exx_acc;
+        eyy_sum[iglo] += eyy_acc;
+        exy_sum[iglo] += exy_acc;
         wt_sum[iglo]  += w_acc;
       }
     }
@@ -417,12 +431,18 @@ static StressFields compute_stress_fields(
   sf.hydrostatic.resize(nb_sca_dof, 0.0);
   sf.oct_shear.resize(nb_sca_dof, 0.0);
   sf.miner.resize(nb_sca_dof, 0.0);
+  sf.exx.resize(nb_sca_dof, 0.0);
+  sf.eyy.resize(nb_sca_dof, 0.0);
+  sf.exy.resize(nb_sca_dof, 0.0);
   for (int i = 0; i < nb_sca_dof; ++i) {
     if (wt_sum[i] > 0) {
       double inv = 1.0 / wt_sum[i];
       sf.hydrostatic[i] = hd_sum[i] * inv;
       sf.oct_shear[i]   = oct_sum[i] * inv;
       sf.miner[i]       = mi_sum[i] * inv;
+      sf.exx[i]         = exx_sum[i] * inv;
+      sf.eyy[i]         = eyy_sum[i] * inv;
+      sf.exy[i]         = exy_sum[i] * inv;
     }
   }
   return sf;
@@ -877,9 +897,10 @@ int main(int argc, char **argv) {
 
   auto run_elasticity = [&](const fct_t &two_mu_fh, const fct_t &lambda_fh) -> RunResult
   {
-    auto steps = build_default_steps();
+    auto steps = build_default_steps(25);
     std::vector<double> U_sum(nb_dof, 0.0);
     std::vector<double> hd_sum(nb_sca, 0.0), oct_sum(nb_sca, 0.0), mi_sum(nb_sca, 0.0);
+    std::vector<double> exx_sum(nb_sca, 0.0), eyy_sum(nb_sca, 0.0), exy_sum(nb_sca, 0.0);
     std::vector<std::vector<double>> all_sols;
     std::vector<StressFields> all_sf;
 
@@ -923,6 +944,9 @@ int main(int argc, char **argv) {
           hd_sum[i]  += sf_step.hydrostatic[i];
           oct_sum[i] += sf_step.oct_shear[i];
           mi_sum[i]  += sf_step.miner[i];
+          exx_sum[i] += sf_step.exx[i];
+          eyy_sum[i] += sf_step.eyy[i];
+          exy_sum[i] += sf_step.exy[i];
         }
         all_sf.push_back(std::move(sf_step));
       }
@@ -938,6 +962,9 @@ int main(int argc, char **argv) {
       hd_sum[i]  *= invN;
       oct_sum[i] *= invN;
       mi_sum[i]  *= invN;
+      exx_sum[i] *= invN;
+      eyy_sum[i] *= invN;
+      exy_sum[i] *= invN;
     }
 
     RunResult res;
@@ -947,7 +974,59 @@ int main(int argc, char **argv) {
     res.sf_avg.hydrostatic = std::move(hd_sum);
     res.sf_avg.oct_shear   = std::move(oct_sum);
     res.sf_avg.miner       = std::move(mi_sum);
+    res.sf_avg.exx         = std::move(exx_sum);
+    res.sf_avg.eyy         = std::move(eyy_sum);
+    res.sf_avg.exy         = std::move(exy_sum);
     return res;
+  };
+
+  // ============================================================
+  // Unified VTK export: per-step + averaged, with strains
+  // ============================================================
+  auto write_result_vtk = [&](const std::string &prefix,
+                              RunResult &result,
+                              cutmesh_t &active_mesh,
+                              const std::vector<ScalarField> &extras = {}) {
+    // Per-step outputs
+    for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
+      std::span<double> sp(result.all_sols[sidx]);
+      fct_t uh_s(Wh, sp);
+      std::span<double> hd_sp(result.all_sf[sidx].hydrostatic); fct_t hd_s(Sh, hd_sp);
+      std::span<double> oc_sp(result.all_sf[sidx].oct_shear);   fct_t oc_s(Sh, oc_sp);
+      std::span<double> mi_sp(result.all_sf[sidx].miner);       fct_t mi_s(Sh, mi_sp);
+      std::span<double> ex_sp(result.all_sf[sidx].exx);         fct_t ex_s(Sh, ex_sp);
+      std::span<double> ey_sp(result.all_sf[sidx].eyy);         fct_t ey_s(Sh, ey_sp);
+      std::span<double> eS_sp(result.all_sf[sidx].exy);         fct_t eS_s(Sh, eS_sp);
+
+      Paraview<mesh_t> w(active_mesh, prefix + "_step_" + std::to_string(sidx+1) + ".vtk");
+      w.add(uh_s, "displacement", 0, 2);
+      w.add(hd_s, "hydrostatic",  0, 1);
+      w.add(oc_s, "oct_shear",    0, 1);
+      w.add(mi_s, "miner_index",  0, 1);
+      w.add(ex_s, "strain_xx",    0, 1);
+      w.add(ey_s, "strain_yy",    0, 1);
+      w.add(eS_s, "strain_xy",    0, 1);
+      for (auto &[fh, name] : extras) w.add(*fh, name, 0, 1);
+    }
+
+    // Averaged output
+    std::span<double> sp_avg(result.U_avg);                    fct_t uh_a(Wh, sp_avg);
+    std::span<double> hd_ap(result.sf_avg.hydrostatic);        fct_t hd_a(Sh, hd_ap);
+    std::span<double> oc_ap(result.sf_avg.oct_shear);          fct_t oc_a(Sh, oc_ap);
+    std::span<double> mi_ap(result.sf_avg.miner);              fct_t mi_a(Sh, mi_ap);
+    std::span<double> ex_ap(result.sf_avg.exx);                fct_t ex_a(Sh, ex_ap);
+    std::span<double> ey_ap(result.sf_avg.eyy);                fct_t ey_a(Sh, ey_ap);
+    std::span<double> eS_ap(result.sf_avg.exy);                fct_t eS_a(Sh, eS_ap);
+
+    Paraview<mesh_t> w(active_mesh, prefix + "_avg.vtk");
+    w.add(uh_a, "displacement", 0, 2);
+    w.add(hd_a, "hydrostatic",  0, 1);
+    w.add(oc_a, "oct_shear",    0, 1);
+    w.add(mi_a, "miner_index",  0, 1);
+    w.add(ex_a, "strain_xx",    0, 1);
+    w.add(ey_a, "strain_yy",    0, 1);
+    w.add(eS_a, "strain_xy",    0, 1);
+    for (auto &[fh, name] : extras) w.add(*fh, name, 0, 1);
   };
 
   // ============================================================
@@ -978,7 +1057,7 @@ int main(int argc, char **argv) {
     // Zero-level is the union of both zero-level curves.
     std::vector<double> phi_combined_data(nb_sca);
     for (int i = 0; i < nb_sca; ++i)
-      phi_combined_data[i] = std::min(-phi_outer_data[i], phi_interface_data[i]);
+      phi_combined_data[i] = std::min(-phi_outer_data[i], phi_interface_data[i] - growth_plate_width); 
 
     std::span<double> phi_outer_span(phi_outer_data);
     fct_t phi_outer_fh(Sh, phi_outer_span);
@@ -1018,57 +1097,10 @@ int main(int argc, char **argv) {
     std::span<double> mat_span(mat_data);
     fct_t mat_fh(Sh, mat_span);
 
-    // Write per-step outputs (trimmed)
-    for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
-      std::span<double> sp(result.all_sols[sidx]);
-      fct_t uh(Wh, sp);
-
-      std::span<double> hd_step_span(result.all_sf[sidx].hydrostatic);
-      fct_t hd_step(Sh, hd_step_span);
-      std::span<double> oct_step_span(result.all_sf[sidx].oct_shear);
-      fct_t oct_step(Sh, oct_step_span);
-      std::span<double> mi_step_span(result.all_sf[sidx].miner);
-      fct_t mi_step(Sh, mi_step_span);
-
-      Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_0_step_" + std::to_string(sidx+1) + ".vtk");
-      w.add(uh, "displacement", 0, 2);
-      w.add(hd_step, "hydrostatic", 0, 1);
-      w.add(oct_step, "oct_shear", 0, 1);
-      w.add(mi_step, "miner_index", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-      w.add(phi_soc_fh, "phi_soc", 0, 1);
-    }
-
-    // Trimmed (cut polygons at SOC boundary)
-    {
-      Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_fields_0.vtk");
-      w.add(uh_avg, "displacement", 0, 2);
-      w.add(hd_fh, "hydrostatic", 0, 1);
-      w.add(oct_fh, "oct_shear", 0, 1);
-      w.add(mi_fh, "miner_index", 0, 1);
-      w.add(mat_fh, "material", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-      w.add(phi_soc_fh, "phi_soc", 0, 1);
-    }
-
-    // Active elements (full quads)
-    {
-      Paraview<mesh_t> w;
-      w.writeActiveMesh(Khi, "output/growth_cutfem/growth_cutfem_active_0.vtk");
-      w.add(uh_avg, "displacement", 0, 2);
-      w.add(hd_fh, "hydrostatic", 0, 1);
-      w.add(oct_fh, "oct_shear", 0, 1);
-      w.add(mi_fh, "miner_index", 0, 1);
-      w.add(mat_fh, "material", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-      w.add(phi_soc_fh, "phi_soc", 0, 1);
-    }
+    // Per-step + averaged VTK (displacement, stress, strains + extras)
+    write_result_vtk("output/growth_cutfem/growth_cutfem_iter_0", result, Khi,
+      {{&phi_outer_fh, "phi_outer"}, {&phi_interface_fh, "phi_interface"},
+       {&phi_combined_fh, "phi_combined"}, {&phi_soc_fh, "phi_soc"}, {&mat_fh, "material"}});
 
     // Trimmed both sides (SOC boundary + bone/cartilage interface)
     write_trimmed_both_vtk(
@@ -1229,73 +1261,19 @@ int main(int argc, char **argv) {
     std::span<double> phi_combined_span(phi_combined_data);
     fct_t phi_combined_fh(Sh, phi_combined_span);
 
-    // Write per-step outputs (trimmed)
-    for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
-      std::span<double> sp(result.all_sols[sidx]);
-      fct_t uh(Wh, sp);
+    // Per-step + averaged VTK
+    std::span<double> mat_span(mat_data);    fct_t mat_fh(Sh, mat_span);
+    std::span<double> inhib_span(inhibition_data); fct_t inhib_fh(Sh, inhib_span);
+    write_result_vtk("output/growth_cutfem/growth_cutfem_iter_1", result, Khi,
+      {{&phi_outer_fh, "phi_outer"}, {&phi_interface_fh, "phi_interface"},
+       {&phi_combined_fh, "phi_combined"}, {&phi_oss, "phi_soc"},
+       {&mat_fh, "material"}, {&inhib_fh, "spline_inhibition"}});
 
-      std::span<double> hd_step_span(result.all_sf[sidx].hydrostatic);
-      fct_t hd_step(Sh, hd_step_span);
-      std::span<double> oct_step_span(result.all_sf[sidx].oct_shear);
-      fct_t oct_step(Sh, oct_step_span);
-      std::span<double> mi_step_span(result.all_sf[sidx].miner);
-      fct_t mi_step(Sh, mi_step_span);
-
-      Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_iter_1_step_" + std::to_string(sidx+1) + ".vtk");
-      w.add(uh, "displacement", 0, 2);
-      w.add(hd_step, "hydrostatic", 0, 1);
-      w.add(oct_step, "oct_shear", 0, 1);
-      w.add(mi_step, "miner_index", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-      w.add(phi_oss, "phi_soc", 0, 1);
-    }
-
-    // Prepare averaged fields
-    std::span<double> sp_avg(result.U_avg);
-    fct_t uh_avg(Wh, sp_avg);
-    std::span<double> hd_span(result.sf_avg.hydrostatic);
-    fct_t hd_fh(Sh, hd_span);
-    std::span<double> oct_span(result.sf_avg.oct_shear);
-    fct_t oct_fh(Sh, oct_span);
-    std::span<double> mi_span(result.sf_avg.miner);
-    fct_t mi_fh(Sh, mi_span);
-    std::span<double> mat_span(mat_data);
-    fct_t mat_fh(Sh, mat_span);
-    std::span<double> inhib_span(inhibition_data);
-    fct_t inhib_fh(Sh, inhib_span);
-
-    // Trimmed (cut polygons at SOC boundary)
-    {
-      Paraview<mesh_t> w(Khi, "output/growth_cutfem/growth_cutfem_fields_1.vtk");
-      w.add(uh_avg, "displacement", 0, 2);
-      w.add(hd_fh, "hydrostatic", 0, 1);
-      w.add(oct_fh, "oct_shear", 0, 1);
-      w.add(mi_fh, "miner_index", 0, 1);
-      w.add(phi_oss, "phi_soc", 0, 1);
-      w.add(mat_fh, "material", 0, 1);
-      w.add(inhib_fh, "spline_inhibition", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-    }
-
-    // Active elements (full quads)
-    {
-      Paraview<mesh_t> w;
-      w.writeActiveMesh(Khi, "output/growth_cutfem/growth_cutfem_active_1.vtk");
-      w.add(uh_avg, "displacement", 0, 2);
-      w.add(hd_fh, "hydrostatic", 0, 1);
-      w.add(oct_fh, "oct_shear", 0, 1);
-      w.add(mi_fh, "miner_index", 0, 1);
-      w.add(phi_oss, "phi_soc", 0, 1);
-      w.add(mat_fh, "material", 0, 1);
-      w.add(inhib_fh, "spline_inhibition", 0, 1);
-      w.add(phi_outer_fh, "phi_outer", 0, 1);
-      w.add(phi_interface_fh, "phi_interface", 0, 1);
-      w.add(phi_combined_fh, "phi_combined", 0, 1);
-    }
+    // Prepare averaged fields for specialized exports below
+    std::span<double> sp_avg(result.U_avg);              fct_t uh_avg(Wh, sp_avg);
+    std::span<double> hd_span(result.sf_avg.hydrostatic); fct_t hd_fh(Sh, hd_span);
+    std::span<double> oct_span(result.sf_avg.oct_shear);  fct_t oct_fh(Sh, oct_span);
+    std::span<double> mi_span(result.sf_avg.miner);       fct_t mi_fh(Sh, mi_span);
 
     // Trimmed both sides (SOC boundary + bone/cartilage interface + ossification front)
     write_trimmed_both_vtk(
@@ -1369,7 +1347,7 @@ int main(int argc, char **argv) {
       if (iglo < 0 || iglo >= nb_sca) continue;
       R2 P = FK.Pt(j);
       phi_domain_data[iglo] = std::max(signed_distance_polygon(P, g_polygon),
-                                        interfaceY - P.y);
+                                        interfaceY + growth_plate_width - P.y);
     }
   }
   std::span<double> phi_domain_span(phi_domain_data);
@@ -1449,9 +1427,12 @@ int main(int argc, char **argv) {
   // ---- Poisson-based ossification loop (independent of MI loop) ----
   // Thresholds sampled in sqrt space (compensates parabolic Poisson distribution)
   // and ordered from highest to lowest so step 0 is most selective.
-  for (int step = 0; step < 10; ++step) {
-    double s = (10.0 - step) / 10.0 * std::sqrt(uh_max);
-    double threshold = s * s;
+  
+  int n_steps = 10;
+
+  for (int step = 0; step < n_steps; ++step) {
+    double t = double (step) / n_steps; // cast at least one of the operands
+    double threshold = uh_max * (1 - t * t);
     std::cout << "\n=== Poisson ossification step " << step
               << " / 10  (threshold = " << threshold << ") ===\n";
 
@@ -1493,21 +1474,11 @@ int main(int argc, char **argv) {
       }
     }
 
-    std::span<double> sp_avg(result.U_avg);      fct_t uh_avg(Wh, sp_avg);
-    std::span<double> hd_sp(result.sf_avg.hydrostatic); fct_t hd_fh(Sh, hd_sp);
-    std::span<double> oct_sp(result.sf_avg.oct_shear);  fct_t oct_fh(Sh, oct_sp);
-    std::span<double> mi_sp(result.sf_avg.miner);       fct_t mi_fh(Sh, mi_sp);
-    std::span<double> phi_sp(phi_oss_data);              fct_t phi_oss_fh(Sh, phi_sp);
-    std::span<double> mat_sp(mat_data);                  fct_t mat_fh(Sh, mat_sp);
+    std::span<double> phi_sp(phi_oss_data); fct_t phi_oss_fh(Sh, phi_sp);
+    std::span<double> mat_sp(mat_data);    fct_t mat_fh(Sh, mat_sp);
 
-    Paraview<mesh_t> w(Khi, "output/step85_cutfem/poisson_oss_step_"
-                             + std::to_string(step) + ".vtk");
-    w.add(uh_avg,    "displacement", 0, 2);
-    w.add(hd_fh,     "hydrostatic",  0, 1);
-    w.add(oct_fh,    "oct_shear",    0, 1);
-    w.add(mi_fh,     "miner_index",  0, 1);
-    w.add(phi_oss_fh,"phi_oss",      0, 1);
-    w.add(mat_fh,    "material",     0, 1);
+    write_result_vtk("output/step85_cutfem/poisson_oss_" + std::to_string(step),
+                     result, Khi, {{&phi_oss_fh, "phi_oss"}, {&mat_fh, "material"}});
   }
   } // end Poisson block
 
