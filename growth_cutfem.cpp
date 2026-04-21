@@ -672,6 +672,7 @@ static void load_restart(std::vector<double> &mi_avg, double &threshold, unsigne
 struct ScalarField { fct_t *fh; std::string name; };
 struct CellFn { std::function<double(const R2&, int kb)> fn; std::string name; };
 using PhiFn = std::function<double(const R2&, int kb)>;
+struct LevelSetClip { PhiFn fn; bool inside_only = false; };
 
 static void clip_polygon_both_sides(
     const std::vector<R2> &poly,
@@ -701,10 +702,38 @@ static void clip_polygon_both_sides(
   if (pos.size() >= 3) out.push_back(std::move(pos));
 }
 
+static void clip_polygon_inside(
+    const std::vector<R2> &poly,
+    const std::vector<double> &phi,
+    std::vector<std::vector<R2>> &out)
+{
+  int n = (int)poly.size();
+  if (n < 3) return;
+  bool all_pos = true;
+  for (double v : phi) { if (v < 0) { all_pos = false; break; } }
+  if (all_pos) return; // fully outside: discard
+  bool all_neg = true;
+  for (double v : phi) { if (v >= 0) { all_neg = false; break; } }
+  if (all_neg) { out.push_back(poly); return; } // fully inside: keep
+
+  std::vector<R2> neg;
+  for (int i = 0; i < n; ++i) {
+    int j = (i + 1) % n;
+    if (phi[i] < 0) neg.push_back(poly[i]);
+    if ((phi[i] < 0) != (phi[j] < 0)) {
+      double t = phi[i] / (phi[i] - phi[j]);
+      R2 x(poly[i].x + t*(poly[j].x - poly[i].x),
+          poly[i].y + t*(poly[j].y - poly[i].y));
+      neg.push_back(x);
+    }
+  }
+  if ((int)neg.size() >= 3) out.push_back(std::move(neg));
+}
+
 static void write_trimmed_both_vtk(
     const std::string &filename,
     const cutmesh_t &Khi,
-    const std::vector<PhiFn> &levelsets,
+    const std::vector<LevelSetClip> &levelsets,
     const std::vector<ScalarField> &sca_fields,
     const std::vector<ScalarField> &cell_fields = {},
     const std::vector<CellFn> &cell_fns = {},
@@ -724,13 +753,16 @@ static void write_trimmed_both_vtk(
     { std::vector<R2> q; for (int i = 0; i < 4; ++i) q.push_back(Khi[ka][i]); polys.push_back(std::move(q)); }
 
     // Clip by each level set sequentially
-    for (auto &phi : levelsets) {
+    for (auto &ls : levelsets) {
       std::vector<std::vector<R2>> next;
       for (auto &poly : polys) {
         std::vector<double> vals;
         vals.reserve(poly.size());
-        for (auto &p : poly) vals.push_back(phi(p, kb));
-        clip_polygon_both_sides(poly, vals, next);
+        for (auto &p : poly) vals.push_back(ls.fn(p, kb));
+        if (ls.inside_only)
+          clip_polygon_inside(poly, vals, next);
+        else
+          clip_polygon_both_sides(poly, vals, next);
       }
       polys = std::move(next);
     }
@@ -986,7 +1018,9 @@ int main(int argc, char **argv) {
   auto write_result_vtk = [&](const std::string &prefix,
                               RunResult &result,
                               cutmesh_t &active_mesh,
-                              const std::vector<ScalarField> &extras = {}) {
+                              const std::vector<ScalarField> &extras = {},
+                              const std::vector<LevelSetClip> &trim_ls = {},
+                              const std::vector<CellFn> &trim_cell_fns = {}) {
     // Per-step outputs
     for (unsigned int sidx = 0; sidx < result.all_sols.size(); ++sidx) {
       std::span<double> sp(result.all_sols[sidx]);
@@ -1007,6 +1041,15 @@ int main(int argc, char **argv) {
       w.add(ey_s, "strain_yy",    0, 1);
       w.add(eS_s, "strain_xy",    0, 1);
       for (auto &[fh, name] : extras) w.add(*fh, name, 0, 1);
+
+      if (!trim_ls.empty()) {
+        write_trimmed_both_vtk(
+            prefix + "_step_" + std::to_string(sidx+1) + "_trimmed.vtk",
+            active_mesh, trim_ls,
+            {{&hd_s, "hydrostatic"}, {&oc_s, "oct_shear"}, {&mi_s, "miner_index"}},
+            {}, trim_cell_fns,
+            &uh_s, "displacement");
+      }
     }
 
     // Averaged output
@@ -1027,6 +1070,15 @@ int main(int argc, char **argv) {
     w.add(ey_a, "strain_yy",    0, 1);
     w.add(eS_a, "strain_xy",    0, 1);
     for (auto &[fh, name] : extras) w.add(*fh, name, 0, 1);
+
+    if (!trim_ls.empty()) {
+      write_trimmed_both_vtk(
+          prefix + "_avg_trimmed.vtk",
+          active_mesh, trim_ls,
+          {{&hd_a, "hydrostatic"}, {&oc_a, "oct_shear"}, {&mi_a, "miner_index"}},
+          {}, trim_cell_fns,
+          &uh_a, "displacement");
+    }
   };
 
   // ============================================================
@@ -1100,13 +1152,17 @@ int main(int argc, char **argv) {
     // Per-step + averaged VTK (displacement, stress, strains + extras)
     write_result_vtk("output/growth_cutfem/growth_cutfem_iter_0", result, Khi,
       {{&phi_outer_fh, "phi_outer"}, {&phi_interface_fh, "phi_interface"},
-       {&phi_combined_fh, "phi_combined"}, {&phi_soc_fh, "phi_soc"}, {&mat_fh, "material"}});
+       {&phi_combined_fh, "phi_combined"}, {&phi_soc_fh, "phi_soc"}, {&mat_fh, "material"}},
+      {{[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }, true},
+       {[](const R2& P, int) { return P.y - interfaceY; }}},
+      {{[](const R2& P, int) -> double { return P.y < interfaceY ? 0.0 : 1.0; },
+        "material_sharp"}});
 
     // Trimmed both sides (SOC boundary + bone/cartilage interface)
     write_trimmed_both_vtk(
         "output/growth_cutfem/growth_cutfem_trimmed_0.vtk", Khi,
-        {[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
-        [](const R2& P, int) { return P.y - interfaceY; }},
+        {{[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }, true},
+        {[](const R2& P, int) { return P.y - interfaceY; }}},
         {{&hd_fh, "hydrostatic"}, {&oct_fh, "oct_shear"},
         {&mi_fh, "miner_index"},
         {&phi_outer_fh, "phi_outer"}, {&phi_interface_fh, "phi_interface"},
@@ -1267,7 +1323,14 @@ int main(int argc, char **argv) {
     write_result_vtk("output/growth_cutfem/growth_cutfem_iter_1", result, Khi,
       {{&phi_outer_fh, "phi_outer"}, {&phi_interface_fh, "phi_interface"},
        {&phi_combined_fh, "phi_combined"}, {&phi_oss, "phi_soc"},
-       {&mat_fh, "material"}, {&inhib_fh, "spline_inhibition"}});
+       {&mat_fh, "material"}, {&inhib_fh, "spline_inhibition"}},
+      {{[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }, true},
+       {[](const R2& P, int) { return P.y - interfaceY; }},
+       {[&phi_oss](const R2& P, int kb) { return phi_oss.evalOnBackMesh(kb, 0, &P.x, 0, 0); }}},
+      {{[&phi_oss](const R2& P, int kb) -> double {
+          if (P.y < interfaceY) return 0.0;
+          return phi_oss.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0 ? 2.0 : 1.0;
+        }, "material_sharp"}});
 
     // Prepare averaged fields for specialized exports below
     std::span<double> sp_avg(result.U_avg);              fct_t uh_avg(Wh, sp_avg);
@@ -1278,9 +1341,9 @@ int main(int argc, char **argv) {
     // Trimmed both sides (SOC boundary + bone/cartilage interface + ossification front)
     write_trimmed_both_vtk(
         "output/growth_cutfem/growth_cutfem_trimmed_1.vtk", Khi,
-        {[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); },
-        [](const R2& P, int) { return P.y - interfaceY; },
-        [&phi_oss](const R2& P, int kb) { return phi_oss.evalOnBackMesh(kb, 0, &P.x, 0, 0); }},
+        {{[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }, true},
+        {[](const R2& P, int) { return P.y - interfaceY; }},
+        {[&phi_oss](const R2& P, int kb) { return phi_oss.evalOnBackMesh(kb, 0, &P.x, 0, 0); }}},
         {{&hd_fh, "hydrostatic"}, {&oct_fh, "oct_shear"},
         {&mi_fh, "miner_index"},
         {&phi_oss, "phi_soc"}, {&inhib_fh, "spline_inhibition"},
@@ -1478,7 +1541,16 @@ int main(int argc, char **argv) {
     std::span<double> mat_sp(mat_data);    fct_t mat_fh(Sh, mat_sp);
 
     write_result_vtk("output/step85_cutfem/poisson_oss_" + std::to_string(step),
-                     result, Khi, {{&phi_oss_fh, "phi_oss"}, {&mat_fh, "material"}});
+                     result, Khi,
+                     {{&phi_oss_fh, "phi_oss"}, {&mat_fh, "material"}},
+                     {{[](const R2& P, int) { return signed_distance_polygon(P, g_polygon); }, true},
+                      {[](const R2& P, int) { return P.y - interfaceY; }},
+                      {[&phi_oss_fh](const R2& P, int kb) {
+                          return phi_oss_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0); }}},
+                     {{[&phi_oss_fh](const R2& P, int kb) -> double {
+                           if (P.y < interfaceY) return 0.0;
+                           return (phi_oss_fh.evalOnBackMesh(kb, 0, &P.x, 0, 0) >= 0.0) ? 2.0 : 1.0;
+                       }, "material_sharp"}});
   }
   } // end Poisson block
 
